@@ -1,7 +1,7 @@
 # Mac mini M5 Pro 文本模型性能摸底评测方案（v4：Splash + MLX-VLM 分引擎口径）
 
 > 项目仓库：`/Users/augustus/Desktop/LLMBenchmark`
-> 评测目标：Qwen3.8-27B（Splash 1.5.0）、Qwen3.6-35B-A3B（Splash 1.5.0）、Gemma-4-26B-A4B（MLX-VLM 0.8.0）
+> 评测目标：第一轮 Qwen3.8-27B（Splash 1.5.0）、Qwen3.6-35B-A3B（Splash 1.5.0）、Gemma-4-26B-A4B（MLX-VLM 0.8.0）；第二轮 Qwen3.8-Flash-Next（Splash 1.5.0，实验性探测）
 > 评测维度：冷加载时间、TTFT / Prefill 速度、Decode 速度、内存占用（RSS / wired / swap）、SSD 流式读取、最大可用上下文、稳定性统计、机器性能影响分析
 > 主测机：`192.168.3.5` / `Jiuwen-MacMini` / SSH alias `macmini-m5-jiuwen`（独占窗口）
 > 核心原则：**不同推理引擎分表记录，不跨引擎直接排名**
@@ -20,6 +20,7 @@
 | Qwen3.8-27B | 计划通过 Ollama/llama.cpp 测 | **Splash GGUF Q4_K_M + DFlash2，资产完整，首轮首选** |
 | Qwen3.6-35B-A3B | 下载 MLX-LM 4bit 约 20.4GB | **复用已有 19GiB MLX 4bit，只补约 1.05GB DFlash2** |
 | Gemma-4-26B-A4B | Ollama 部署 + MLX 备选 | **必须走 MLX-VLM**（Splash 不支持 `gemma4`） |
+| Qwen3.8-Flash-Next | ❌ 不作本轮正式基线 | **第二轮实验性探测**（低比特/SSD 流式，缩减矩阵，表 D 单列不排名） |
 | 上下文阶梯 | 8K→16K→32K→64K→128K | **1K→8K→32K→64K→128K**，128K 稳定后单独探测 256K |
 | 新增指标 | — | 冷加载时间、wired memory、SSD 读写（流式检测）、error/timeout、finish_reason、均值/中位数/P95 |
 | 对比口径 | 允许 Ollama 与 MLX 同表标注比较 | **强制分表**：同引擎内排名，跨引擎只做观察 |
@@ -53,7 +54,7 @@
 | Qwen3.8-27B | Splash | `/Users/jiuwen/Models/splash/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf`（16,464,440,224 B ≈ 15.33GiB） | DFlash2 `/Users/jiuwen/Models/splash/Qwen3.8-27B-DFlash2/model.safetensors`（≈ 3.58GiB）+ mmproj BF16（≈ 887MiB） | ✅ 可立即 smoke |
 | Qwen3.6-35B-A3B | Splash | `/Users/jiuwen/Models/Qwen3.6-35B-A3B-4bit`（MLX 4bit affine，约 19GiB，已过 Splash 架构检查） | 缺 DFlash2：`incoai/Qwen3.6-35B-A3B-DFlash2` revision `51ef7b6923ad6c14cb1bb41c37a9041446496ab6`，约 1.05GB | ⚠️ 补 draft 后可用 |
 | Gemma-4-26B-A4B | MLX-VLM | `/Users/jiuwen/Models/gemma-4-26b-a4b-it-4bit`（约 14GiB，3 分片完整） | — | ✅ 可立即 smoke |
-| Qwen3.8-Flash-Next | Splash | 无完整资产 | — | ❌ 不作本轮正式基线 |
+| Qwen3.8-Flash-Next（第二轮） | Splash | 无完整权重资产 | — | ⚠️ 实验性：低比特（IQ2/Q2 类）或 SSD 流式，下载校验通过后才启动 |
 
 注意：同目录其他 Q5/Q6/Q8 GGUF 多为 135～136 字节 LFS pointer，不是有效权重（先查文件大小）。
 
@@ -76,7 +77,7 @@
 
 ### 1.4 结论
 
-> 3.5 机器与资产足够。推荐顺序：先用 Splash 测 Qwen3.8-27B（资产完整），再补 Qwen3.6 DFlash2 用 Splash 测 Qwen3.6；Gemma-4-26B-A4B 走 MLX-VLM。**正式 benchmark 必须等独占窗口。**
+> 3.5 机器与资产足够。评测分两轮：**第一轮**依次测 Qwen3.8-27B（Splash，资产完整）→ Qwen3.6-35B-A3B（Splash，补 DFlash2）→ Gemma-4-26B-A4B（MLX-VLM）；**第二轮**为 Qwen3.8-Flash-Next 实验性探测（Q4 约 65~75GB 超出 64GB 内存，只做低比特/SSD 流式口径，不作正式基线）。**正式 benchmark 必须等独占窗口。**
 
 ---
 
@@ -162,6 +163,9 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 | `--max-context` | 上下文上限 | smoke 用 8K；正式按矩阵提升 |
 | `--queue-size 1` | 并发队列 | 正式单请求口径 |
 | `--idle-release` | 空闲释放权重 | 共享机更安全，但复测重新加载（冷加载） |
+| `--expert-memory` | MoE 专家 RAM 槽位（第二轮 Flash-Next 用） | 不足时专家从 SSD 流式读取，速度下降 |
+| `--ple-memory` | Flash-Next PLE/n-gram 表缓存 | 不设或过小会流式读 SSD |
+| `--sparse-kv-memory` | Flash-Next 稀疏 KV 缓存 | 影响长上下文性能 |
 
 三个容易混淆的"支持"：**架构支持 ≠ 资产完整；能加载 ≠ 能稳定正式评测；能出 tok/s ≠ 发挥最大性能。**
 
@@ -215,6 +219,24 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
   → 表 A/B/C 各自汇总，不合并排名
   → 冷加载、TTFT、Prefill、Decode、内存、上下文稳定性、SSD 读取
   → 异常样本单独说明，不删除失败记录
+```
+
+第二轮（第一轮报告完成并经确认后，独立窗口）：
+
+```text
+[R2-Gate] 前置门槛
+  → Flash-Next 低比特权重下载 + 哈希校验（未就绪则推迟）
+  → 第一轮表 A/B/C 报告完成
+
+[R2-1] Flash-Next Splash smoke（端口 18082）
+  → 显式设置并记录 --expert-memory / --ple-memory / --sparse-kv-memory
+
+[R2-2] 缩减矩阵 1K → 8K（正式尝试）+ 32K 单独探测
+  → 不执行 64K/128K/256K（Q4 约 65~75GB 超出 64GB 内存）
+
+[R2-3] 表 D 单独输出（实验性口径）
+  → 重点记录 SSD 流式读取对 Decode 的影响与边界行为
+  → 不与表 A/B/C 排名
 ```
 
 ---
@@ -401,7 +423,7 @@ iostat -w 1 -d disk0 60
 
 ### 5.7 上下文阶梯与固定参数
 
-阶梯：`1K → 8K → 32K → 64K → 128K`；128K 稳定后单独探测 `256K`。
+阶梯：`1K → 8K → 32K → 64K → 128K`；128K 稳定后单独探测 `256K`。（第二轮 Flash-Next 缩减为 1K/8K 正式尝试 + 32K 单独探测，见第四节 Round 2。）
 
 | 上下文点 | 记录项 |
 |---|---|
@@ -566,6 +588,8 @@ sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；
 
 表 B（Splash / Qwen3.6-35B-A3B，MLX 4bit + DFlash2）与表 C（MLX-VLM 0.8.0 / Gemma-4-26B-A4B，MLX 4bit）用同一模板。**三表不合并排名；跨引擎只做观察性对比并显式标注引擎差异。**
 
+**表 D（第二轮实验性）**：Splash / Qwen3.8-Flash-Next 低比特，缩减矩阵 1K/8K + 32K 探测，单列输出，不与第一轮排名；启动参数 `--expert-memory` / `--ple-memory` / `--sparse-kv-memory` 必须逐次记录。
+
 ### 8.3 图表输出
 
 - 图 1：TTFT 与 Prefill tok/s 随输入长度变化（分引擎曲线）；
@@ -656,6 +680,13 @@ Gemma-4-26B-A4B-MLXVLM-4bit-32K-Jiuwen35
 - [ ] 保存原始日志、命令、模型 revision 和测试日期；
 - [ ] 异常样本单独说明，不删除失败记录。
 
+### P3：第二轮 Qwen3.8-Flash-Next（第一轮完成并经确认后启动）
+
+- [ ] 低比特权重下载、文件大小与哈希校验（未就绪则推迟）；
+- [ ] Splash 启动并逐次记录 `--expert-memory` / `--ple-memory` / `--sparse-kv-memory`；
+- [ ] 缩减矩阵 1K/8K 正式尝试 + 32K 单独探测；
+- [ ] 表 D 单独输出，标注实验性口径，不参与任何排名。
+
 ---
 
 ## 十一、Gemma-4-26B-A4B MLX-VLM 专项说明
@@ -698,6 +729,8 @@ Gemma 配置为 `Gemma4ForConditionalGeneration` / `gemma4`（text：`gemma4_tex
 | `--max-memory` 过高 | 中 | 触发系统 swap，速度失真 | 从 40G/42G 起步按实测调整 |
 | 下载/写入期间测速 | 中 | SSD I/O 污染计时 | 错峰；测速窗口内无下载 |
 | LFS pointer 误用 | 低 | 135 字节文件不是权重 | 先 `ls -lh` 验证大小 |
+| Flash-Next 资产未就绪 | 中高 | 第二轮硬门槛 | 下载校验完成前不启动 |
+| 低比特结果被误读为模型质量 | 中 | 表 D 口径 | 明确标注 IQ2/Q2 实验性，不代表模型真实能力 |
 
 ### 12.2 历史版本说明
 
