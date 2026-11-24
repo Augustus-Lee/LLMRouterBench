@@ -283,3 +283,5 @@ results/inference
 
 # SGI-Bench runner script (contains local config, use run_sgibench.sh.example as template)
 run_sgibench.sh
+# Mac 性能评测原始数据（可由 bench 脚本重建；汇总表与图表保留提交）
+results/mac_benchmark/raw/
