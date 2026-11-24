@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import datetime
 import math
 import os
 import platform
@@ -46,6 +48,10 @@ _VOCAB: Tuple[str, ...] = (
 
 class BenchRequestError(RuntimeError):
     """OpenAI 兼容请求失败（HTTP 错误、连接失败、超时、响应不完整）。"""
+
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +93,50 @@ def synthesize_prompt(target_tokens: int, seed: int = 42) -> str:
         words.extend(rng.choice(_VOCAB) for _ in range(take))
         total += take
     return " ".join(words)
+
+
+def load_workload_records(path: str, contexts: Optional[Sequence[int]] = None
+                           ) -> List[Dict[str, Any]]:
+    """读取构建器生成的 performance JSONL，并按目标 token 档位过滤。
+
+    文件是逐模型 tokenizer 校准的；``contexts`` 仍是目标档位，不是某个
+    服务端实际返回的 prompt_tokens。读取阶段只做结构校验，服务端 usage
+    仍是正式测量中的最终 token 数。
+    """
+    wanted = set(contexts) if contexts is not None else None
+    records: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+            if not isinstance(rec, dict):
+                raise ValueError(f"{path}:{line_no}: record is not an object")
+            for key in ("id", "layer", "target_tokens", "actual_tokens", "text"):
+                if rec.get(key) in (None, ""):
+                    raise ValueError(f"{path}:{line_no}: missing {key}")
+            if not isinstance(rec["target_tokens"], int):
+                raise ValueError(f"{path}:{line_no}: target_tokens must be int")
+            if not isinstance(rec["actual_tokens"], int):
+                raise ValueError(f"{path}:{line_no}: actual_tokens must be int")
+            if wanted is not None and rec["target_tokens"] not in wanted:
+                continue
+            records.append(rec)
+    if not records:
+        raise ValueError(f"{path}: no workload records selected by contexts {sorted(wanted or [])}")
+    return records
+
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +333,76 @@ def extract_server_timings(data: Dict[str, Any]) -> Tuple[
 # OpenAI 兼容客户端（Splash / MLX-VLM 共用）
 # ---------------------------------------------------------------------------
 
+def _iso_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _extract_server_wall_s(data: Dict[str, Any]) -> Optional[float]:
+    """从 response 提取服务端总处理时长（秒）。"""
+    rl = data.get("request_latency")
+    if isinstance(rl, dict) and rl.get("wall_ms") is not None:
+        try:
+            return float(rl["wall_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            return None
+    timings = data.get("timings")
+    if isinstance(timings, dict) and timings.get("wall_ms") is not None:
+        try:
+            return float(timings["wall_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _first_int(*values: Any) -> Optional[int]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_reasoning_tokens(data: Dict[str, Any],
+                              usage: Optional[Dict[str, Any]]) -> int:
+    """reasoning token 数；服务端不提供时返回 -1，不使用 0 冒充。"""
+    candidates = []
+    if isinstance(usage, dict):
+        candidates.append(usage.get("reasoning_tokens"))
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            candidates.append(details.get("reasoning_tokens"))
+    candidates.append(data.get("reasoning_tokens"))
+    value = _first_int(*candidates)
+    return value if value is not None else -1
+
+
+def _extract_cache_status(usage: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int]]:
+    """提取 prompt 缓存命中状态与 token 数。
+
+    未返回缓存字段时保持 None；0 命中显式标记为 miss。
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = _first_int(details.get("cached_tokens"), details.get("cache_hit_tokens"))
+    else:
+        cached = _first_int(usage.get("cached_tokens"), usage.get("cache_hit_tokens"))
+    if cached is None:
+        return None, None
+    prompt_tokens = _first_int(usage.get("prompt_tokens"))
+    if cached == 0:
+        return "miss", 0
+    if prompt_tokens is not None:
+        if cached >= prompt_tokens:
+            return "hit", cached
+        return "partial", cached
+    return "hit", cached
+
+
 class OpenAICompatClient:
     """最小 OpenAI /v1/chat/completions 客户端（stdlib urllib 实现）。
 
@@ -316,7 +436,7 @@ class OpenAICompatClient:
                 detail = exc.read().decode("utf-8", "replace")[:500]
             except Exception:
                 pass
-            raise BenchRequestError(f"HTTP {exc.code}: {detail}") from exc
+            raise BenchRequestError(f"HTTP {exc.code}: {detail}", status_code=exc.code) from exc
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             raise BenchRequestError(f"request failed: {exc}") from exc
         try:
@@ -344,15 +464,24 @@ class OpenAICompatClient:
             "seed": seed,
             "stream": False,
         }
+        request_start_time = _iso_now()
         started = time.perf_counter()
         data = self._post(payload)
+        response_end_time = _iso_now()
         e2e_s = time.perf_counter() - started
 
         choices = data.get("choices") or []
         finish_reason = choices[0].get("finish_reason") if choices else None
+        content = None
+        if choices:
+            msg = choices[0].get("message") or {}
+            content = msg.get("content")
         usage = data.get("usage") or {}
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
+        reasoning_tokens = _extract_reasoning_tokens(data, usage)
+        cache_status, cache_hit_tokens = _extract_cache_status(usage)
+        server_wall_s = _extract_server_wall_s(data)
         prefill_s, decode_s, source = extract_server_timings(data)
 
         prefill_tps = None
@@ -364,8 +493,16 @@ class OpenAICompatClient:
 
         return {
             "stream": False,
+            "content": content,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_status": cache_status,
+            "cache_hit_tokens": cache_hit_tokens,
+            "server_wall_s": server_wall_s,
+            "request_start_time": request_start_time,
+            "first_token_time": None,
+            "response_end_time": response_end_time,
             "ttft_s": None,  # 非流式无法测 TTFT
             "prefill_s": prefill_s,
             "decode_s": decode_s,
@@ -398,6 +535,7 @@ class OpenAICompatClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        request_start_time = _iso_now()
         started = time.perf_counter()
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout_s)
@@ -407,7 +545,7 @@ class OpenAICompatClient:
                 detail = exc.read().decode("utf-8", "replace")[:500]
             except Exception:
                 pass
-            raise BenchRequestError(f"HTTP {exc.code}: {detail}") from exc
+            raise BenchRequestError(f"HTTP {exc.code}: {detail}", status_code=exc.code) from exc
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             raise BenchRequestError(f"request failed: {exc}") from exc
 
@@ -415,8 +553,10 @@ class OpenAICompatClient:
         first_content_t: Optional[float] = None
         last_chunk_t: Optional[float] = None
         content_chunks = 0
+        content_parts: List[str] = []
         finish_reason: Optional[str] = None
         usage: Optional[Dict[str, Any]] = None
+        first_token_time: Optional[str] = None
 
         try:
             for raw_line in resp:
@@ -440,9 +580,11 @@ class OpenAICompatClient:
                     delta = choices[0].get("delta") or {}
                     if delta.get("content"):
                         content_chunks += 1
+                        content_parts.append(delta["content"])
                         if first_content_t is None:
                             first_content_t = now
                             ttft_s = now - started
+                            first_token_time = _iso_now()
                 if chunk.get("usage"):
                     usage = chunk["usage"]
         except (OSError, urllib.error.URLError) as exc:
@@ -450,12 +592,15 @@ class OpenAICompatClient:
         finally:
             resp.close()
 
+        response_end_time = _iso_now()
         e2e_s = (last_chunk_t or time.perf_counter()) - started
         prompt_tokens = usage.get("prompt_tokens") if usage else None
         if usage and usage.get("completion_tokens") is not None:
             completion_tokens = usage.get("completion_tokens")
         else:
             completion_tokens = content_chunks if content_chunks else None
+        reasoning_tokens = _extract_reasoning_tokens({}, usage)
+        cache_status, cache_hit_tokens = _extract_cache_status(usage)
 
         decode_s: Optional[float] = None
         if first_content_t is not None and last_chunk_t is not None:
@@ -466,8 +611,16 @@ class OpenAICompatClient:
 
         return {
             "stream": True,
+            "content": "".join(content_parts) if content_parts else None,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_status": cache_status,
+            "cache_hit_tokens": cache_hit_tokens,
+            "server_wall_s": None,
+            "request_start_time": request_start_time,
+            "first_token_time": first_token_time,
+            "response_end_time": response_end_time,
             "ttft_s": ttft_s,
             "prefill_s": None,  # 客户端无法拆分 prefill
             "decode_s": decode_s,
@@ -668,8 +821,28 @@ def run_benchmark(args: Any, client: OpenAICompatClient) -> List[str]:
     os.makedirs(out_dir, exist_ok=True)
     written: List[str] = []
     contexts: List[int] = args.contexts
+    workload_file = getattr(args, "workload_file", None)
+    workload_file_sha256: Optional[str] = None
 
-    for ctx in contexts:
+    if workload_file:
+        workloads = load_workload_records(workload_file, contexts=contexts)
+        workload_file_sha256 = file_sha256(workload_file)
+        print(f"[bench] workload={workload_file} "
+              f"selected={len(workloads)} sha256={workload_file_sha256[:12]}")
+    else:
+        workloads = [{
+            "id": None,
+            "layer": "synthetic",
+            "target_tokens": ctx,
+            "actual_tokens": ctx,
+            "text": synthesize_prompt(ctx, seed=args.seed),
+            "text_sha256": None,
+        } for ctx in contexts]
+
+    for item in workloads:
+        # context_tokens 是测试档位；actual_tokens 只作为 workload 构建时
+        # 的 tokenizer 校准值。正式输入长度仍以服务端 prompt_tokens 为准。
+        ctx = int(item["target_tokens"])
         record = make_run_record(
             engine=args.engine,
             engine_version=args.engine_version,
@@ -690,7 +863,50 @@ def run_benchmark(args: Any, client: OpenAICompatClient) -> List[str]:
             repeat_runs=args.repeat,
             revision_or_digest=getattr(args, "revision_or_digest", None),
         )
-        prompt = synthesize_prompt(ctx, seed=args.seed)
+        prompt = str(item["text"])
+        workload_id = item.get("id")
+        if workload_id:
+            record.update({
+                "workload_id": workload_id,
+                "workload_file": workload_file,
+                "workload_file_sha256": workload_file_sha256,
+                "workload_sha256": item.get("text_sha256"),
+                "workload_layer": item.get("layer"),
+                "workload_target_tokens": item.get("target_tokens"),
+                "workload_calibrated_tokens": item.get("actual_tokens"),
+                "workload_tokenizer": item.get("tokenizer"),
+                "workload_tokenizer_revision": item.get("tokenizer_revision"),
+                "workload_tokenizer_exact": item.get("tokenizer_exact"),
+                "source_dataset": item.get("source_dataset"),
+                "source_revision": item.get("source_revision"),
+                "source_split": item.get("source_split"),
+                "source_ids": item.get("source_ids"),
+                "source_license": item.get("source_license"),
+                "construction": item.get("construction"),
+                "boundary_probe": bool(item.get("boundary_probe")),
+                "question_included": bool(item.get("question_included")),
+            })
+        else:
+            record.update({
+                "workload_id": None,
+                "workload_file": None,
+                "workload_file_sha256": None,
+                "workload_sha256": None,
+                "workload_layer": "synthetic",
+                "workload_target_tokens": ctx,
+                "workload_calibrated_tokens": ctx,
+                "workload_tokenizer": None,
+                "workload_tokenizer_revision": None,
+                "workload_tokenizer_exact": False,
+                "source_dataset": None,
+                "source_revision": None,
+                "source_split": None,
+                "source_ids": [],
+                "source_license": None,
+                "construction": "synthetic_repeated_vocabulary",
+                "boundary_probe": ctx >= 262144,
+                "question_included": False,
+            })
         messages = [{"role": "user", "content": prompt}]
 
         monitor = SystemMonitor(pid=getattr(args, "server_pid", None),
@@ -722,10 +938,15 @@ def run_benchmark(args: Any, client: OpenAICompatClient) -> List[str]:
         if notes:
             record["notes"] = "; ".join(notes)[:500]
 
-        path = os.path.join(out_dir, f"{args.engine}_{ctx}.json")
+        if workload_id:
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(workload_id))
+            filename = f"{args.engine}_{safe_id}.json"
+        else:
+            filename = f"{args.engine}_{ctx}.json"
+        path = os.path.join(out_dir, filename)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
         written.append(path)
-        print(f"[bench] ctx={ctx} -> {path} "
+        print(f"[bench] ctx={ctx} workload={workload_id or 'synthetic'} -> {path} "
               f"(ok={record['success']}, errors={record['error_count']})")
     return written

@@ -1,17 +1,29 @@
-# Mac mini M5 Pro 文本模型性能摸底评测方案（v4：Splash + MLX-VLM 分引擎口径）
+# Mac mini M5 Pro 文本模型性能摸底评测方案（v5：仓库原生能力评测集 + 并发阶梯 + 机器指标实时监控）
 
 > 项目仓库：`/Users/augustus/Desktop/LLMBenchmark`
 > 评测目标：第一轮 Qwen3.8-27B（Splash 1.5.0）、Qwen3.6-35B-A3B（Splash 1.5.0）、Gemma-4-26B-A4B（MLX-VLM 0.8.0）；第二轮 Qwen3.8-Flash-Next（Splash 1.5.0，实验性探测）
 > 评测维度：冷加载时间、TTFT / Prefill 速度、Decode 速度、内存占用（RSS / wired / swap）、SSD 流式读取、最大可用上下文、稳定性统计、机器性能影响分析
 > 主测机：`192.168.3.5` / `Jiuwen-MacMini` / SSH alias `macmini-m5-jiuwen`（独占窗口）
 > 核心原则：**不同推理引擎分表记录，不跨引擎直接排名**
-> 日期：2026-11-24（v4）
+> 日期：2026-11-24（v5）
 > 本次修订依据：[Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md](./Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md)（2026-11-24，Splash/MLX-VLM 实机核查）
 > 历史版本：v3 及更早版本（Ollama 统一基线 + MLX-LM 专项、三机对比口径）保留在 git 历史中，本版起不再维护该口径。
+> v5 修订：评测集改用仓库原生能力评测集（GPQA、MMLU、MMLU-Pro、MATH500、ARC-C、GSM8K）；正式口径为相同 query 的并发阶梯式上涨（1→2→4→8→16），并在全程实时监控 CPU/GPU/NPU 使用率、内存、算力和带宽并输出时间序列图。以上述修订与后文 v5 标注内容为准。
 
 ---
 
-## 〇、v4 相对 v3 的关键变更
+## 〇、版本变更记录
+
+### 〇.1 v5 相对 v4 的关键变更（本版）
+
+| 变更项 | v4（2026-11-24） | v5（本版） |
+|---|---|---|
+| 评测集 | 官方全量数据构造固定输入 | **仓库原生能力评测集：GPQA / MMLU / MMLU-Pro / MATH500 / ARC-C / GSM8K** |
+| 并发口径 | 单请求（`--queue-size 1`） | **并发阶梯 1→2→4→8→16，档位间分表分图，不混算** |
+| 机器监控 | 关键点手动采样 | **全程实时采样 CPU/GPU/NPU、内存、算力、带宽，输出时间序列图（图 6～9）** |
+| 汇总模板 | 单表汇总 | **按并发档位分表（表 A-c1…），并补"错误/超时"列** |
+
+### 〇.2 v4 相对 v3 的关键变更
 
 | 变更项 | v3（2026-11-23） | v4（2026-11-24） |
 |---|---|---|
@@ -21,7 +33,6 @@
 | Qwen3.6-35B-A3B | 下载 MLX-LM 4bit 约 20.4GB | **复用已有 19GiB MLX 4bit，只补约 1.05GB DFlash2** |
 | Gemma-4-26B-A4B | Ollama 部署 + MLX 备选 | **必须走 MLX-VLM**（Splash 不支持 `gemma4`） |
 | Qwen3.8-Flash-Next | ❌ 不作本轮正式基线 | **第二轮实验性探测**（低比特/SSD 流式，缩减矩阵，表 D 单列不排名） |
-| 上下文阶梯 | 8K→16K→32K→64K→128K | **1K→8K→32K→64K→128K**，128K 稳定后单独探测 256K |
 | 新增指标 | — | 冷加载时间、wired memory、SSD 读写（流式检测）、error/timeout、finish_reason、均值/中位数/P95 |
 | 对比口径 | 允许 Ollama 与 MLX 同表标注比较 | **强制分表**：同引擎内排名，跨引擎只做观察 |
 | 资源前提 | 建议释放 3.13 Splash | **3.5 独占窗口是硬前提**：停止 Ollama 35B（约 30GiB）与 MLX 9B（约 5GiB） |
@@ -71,7 +82,7 @@
 规则：
 
 - **未取得机器使用方同意前，不得直接 kill 任何共享服务**；先 `ps`/`lsof` 记录，再协商；
-- 正式口径：单模型、单实例、单请求串行、并发 `queue/concurrency = 1`；
+- 正式口径：单模型、单实例；评测集统一使用仓库原生能力评测集（GPQA/MMLU/MMLU-Pro/MATH500/ARC-C/GSM8K）；并发按阶梯 `1→2→4→8→16` 上涨，`concurrency=1` 仅为低并发基线；
 - 本轮性能端口约定：Splash Qwen3.8 → `18080`，Splash Qwen3.6 → `18081`，MLX-VLM Gemma → `18091`；
 - 测完一个模型完整退出进程后再启动下一个；磁盘写入、下载、索引构建期间不测速。
 
@@ -125,11 +136,11 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 
 **测法：** 采样磁盘读写速率；Splash 场景重点观察 `--expert-memory` 不足导致的专家流式读取和 Flash-Next 的 PLE/n-gram 流式读取。
 
-### 2.5 最大支持上下文
+### 2.5 能力评测集与输入长度
 
-**定义：** 在 3.5 独占条件下实际能跑通的最大上下文。
+**定义：** 使用仓库原生能力评测集作为实际 query，观察不同输入长度、难度和并发下的性能与机器资源。
 
-**测法：** 阶梯 `1K → 8K → 32K → 64K → 128K`；128K 稳定后**单独探测 256K**（不默认成功，单独记录成败）。128K 是 64GB 单机较现实的正式上限。模型配置的 `max_position_embeddings` 只是架构上限。
+**测法：** 按 `dataset_id` 统计实际 `prompt_tokens`，按长度分桶分析；长输入能力题单独探测，不默认进入正式主矩阵。模型配置的 `max_position_embeddings` 只是架构上限。
 
 ### 2.6 稳定性统计
 
@@ -139,9 +150,23 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 
 **定义：** 分析内存带宽、GPU 核数与架构、温控降频、SSD 流式读取、`--max-memory` 配置对速度的影响。见第七节。
 
+### 2.8 机器资源实时监控（v5 新增）
+
+在推理过程中同步采样并保存下述机器指标，最后输出时间序列图；每类指标都要区分“占用/总量”或给出单位：
+
+| 指标 | 定义 / 采集方式 |
+|---|---|
+| GPU / NPU 使用率 | Apple 统一 GPU 与 ANE 的 duty cycle / 频率 / 功率，口径为占用/总量；有 sudo 时使用 `powermetrics --samplers gpu_power,ane_power`，无 sudo 显式标记“未采集” |
+| CPU 使用率 | 各核心 user/sys/idle/nice 比例，记录占用核数/总核数；`top -l`、`ps`、可选 `powermetrics --samplers cpu_power` |
+| 内存（含统一内存） | RAM 已用/空闲/缓存/可用、进程 RSS、swap；`vm_stat`、`sysctl hw.memsize`、`memory_pressure`、`sysctl vm.swapusage` |
+| 算力（TFLOPS / PFLOPS） | 必须记录模型量化单位/`weight_format`；由参数规模与实测 token/时间换算有效浮点吞吐，理论峰值与实测分列，禁止把模型参数直接当作实测算力 |
+| GPU / NPU 带宽 | 官方理论值（按规格记，如 120GB/s）与实测带宽；实测带宽须用内存带宽核验，不得用 tok/s 代替 |
+
+这些指标按并发档位分面记录；“未采集”的字段标 `null`，不得用推测值补齐。
+
 ---
 
-## 三、推理引擎选型（v4）
+## 三、推理引擎选型（v4；v5 修订并发参数口径）
 
 ### 3.1 Splash 1.5.0（Qwen 系主引擎）
 
@@ -160,8 +185,8 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 | `--max-memory` | 内存上限 | 40G/42G 是保守起点，按实测 RSS 调整；设过高会触发系统 swap |
 | `--kv-format int8` | KV 精度 | 全程固定，不混测 FP16/INT8 |
 | `--state-format bf16` | 状态精度 | 固定 |
-| `--max-context` | 上下文上限 | smoke 用 8K；正式按矩阵提升 |
-| `--queue-size 1` | 并发队列 | 正式单请求口径 |
+| `--max-context` | 上下文上限 | smoke 用短能力题；正式按能力集与并发矩阵调整 |
+| `--queue-size` | 并发队列 | 按并发档位设置（1→2→4→8→16）；冒烟与冷加载测量固定 1 |
 | `--idle-release` | 空闲释放权重 | 共享机更安全，但复测重新加载（冷加载） |
 | `--expert-memory` | MoE 专家 RAM 槽位（第二轮 Flash-Next 用） | 不足时专家从 SSD 流式读取，速度下降 |
 | `--ple-memory` | Flash-Next PLE/n-gram 表缓存 | 不设或过小会流式读 SSD |
@@ -173,7 +198,7 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 
 `/Users/jiuwen/mlx-bench-venv` 已含 `gemma4` / `gemma4_text` 实现。要点：
 
-- 正式测试固定 `--max-num-seqs 1`，防并发污染；
+- `--max-num-seqs` 按并发档位设置（1→2→4→8→16），冒烟与冷加载测量固定 1，防并发污染；
 - `--max-tokens` 是单次生成上限，不是上下文窗口；
 - 就绪判断以 `/health` 返回 `model_ready=true` 为准。
 
@@ -203,21 +228,21 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
   → 停止 Ollama 35B 与 MLX-LM 9B；确认 18080/18081/18091 无冲突
 
 [Step 1] Qwen3.8-27B Splash（表 A）
-  → 8K smoke test：/ready、/status、chat completion、日志无 EOF/OOM
-  → 正式矩阵 1K/8K/32K/64K/128K（warm-up 1 + 重复 3~5）
-  → 256K 单独探测
+  → smoke test：/ready、/status、chat completion、日志无 EOF/OOM
+  → 六类能力评测集 × 并发阶梯 1→2→4→8→16（warm-up 1 + 重复 3~5）
+  → 长输入能力题单独探测
 
 [Step 2] Qwen3.6-35B-A3B Splash（表 B）
   → 固定 revision 下载 DFlash2（约 1.05GB）并校验哈希
-  → 8K smoke test → 同一矩阵 → 256K 探测
+  → smoke test → 同一能力集与并发阶梯 → 长题探测
 
 [Step 3] Gemma-4-26B-A4B MLX-VLM（表 C）
-  → CLI smoke → 常驻服务（--max-num-seqs 1）→ /health model_ready
-  → 同一输入/输出长度矩阵 → 256K 探测
+  → CLI smoke → 常驻服务 → /health model_ready
+  → 同一能力集与并发阶梯 → 长题探测
 
 [Step 4] 分引擎汇总
   → 表 A/B/C 各自汇总，不合并排名
-  → 冷加载、TTFT、Prefill、Decode、内存、上下文稳定性、SSD 读取
+  → 冷加载、TTFT、Prefill、Decode、内存、能力集稳定性、SSD 读取
   → 异常样本单独说明，不删除失败记录
 ```
 
@@ -231,8 +256,8 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 [R2-1] Flash-Next Splash smoke（端口 18082）
   → 显式设置并记录 --expert-memory / --ple-memory / --sparse-kv-memory
 
-[R2-2] 缩减矩阵 1K → 8K（正式尝试）+ 32K 单独探测
-  → 不执行 64K/128K/256K（Q4 约 65~75GB 超出 64GB 内存）
+[R2-2] 能力题缩减集并发探测 + 长题单独探测
+  → 不默认执行超长输入（Q4 约 65~75GB 超出 64GB 内存）
 
 [R2-3] 表 D 单独输出（实验性口径）
   → 重点记录 SSD 流式读取对 Decode 的影响与边界行为
@@ -412,22 +437,23 @@ RSS
 
 # 系统内存压力 / swap
 memory_pressure
-vm_stat            # wired 内存从 internal/wired 页统计
+vm_stat            # wired 内存、free/active/inactive/cache
 sysctl vm.swapusage
+sysctl hw.memsize  # 统一内存总量，用于“占用/总量”口径
 
 # SSD 读写采样（判断是否流式读取权重/专家）
 iostat -w 1 -d disk0 60
+
+# CPU/GPU/NPU 实时采样（需要 sudo；无权限时标记“未采集”）
+sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 -n 60 \
+  -o results/mac_benchmark/monitor/powermetrics.txt
 ```
 
-每档上下文同时记录：峰值 RSS、wired memory、swap 增量、SSD 读写速率、error/timeout、finish_reason。
+每档能力评测与并发同时记录：峰值 RSS、wired memory、swap 增量、SSD 读写速率、CPU/GPU/NPU、算力、带宽、error/timeout、finish_reason。
 
-### 5.7 上下文阶梯与固定参数
+### 5.7 能力评测集与固定参数
 
-阶梯：`1K → 8K → 32K → 64K → 128K`；128K 稳定后单独探测 `256K`。（第二轮 Flash-Next 缩减为 1K/8K 正式尝试 + 32K 单独探测，见第四节 Round 2。）
-
-| 上下文点 | 记录项 |
-|---|---|
-| 每档 | cold load time、TTFT、Prefill tok/s、Decode tok/s、prompt_tokens、completion_tokens、峰值 RSS、wired、swap、SSD 读写、error、finish_reason |
+正式 query 使用仓库原生能力评测集（见 5.9），不再按固定上下文阶梯构造输入。每个并发档位均记录：cold load time、TTFT、Prefill tok/s、Decode tok/s、`prompt_tokens`、`completion_tokens`、峰值 RSS、wired、swap、SSD 读写、CPU/GPU/NPU、算力、带宽、error、`finish_reason` 与判分结果。
 
 固定参数：
 
@@ -437,8 +463,8 @@ top_p = 1
 max_tokens = 固定值（各档一致）
 stream = 固定
 KV format = int8（Splash 全程固定）
-context limit = 测试点
-queue/concurrency = 1
+context limit = 冒烟 8K；正式统一 32K（与 8.1 JSON 模板 context_tokens 一致），内存受限时按实测下调并记录
+queue/concurrency = 1 → 2 → 4 → 8 → 16（阶梯上涨；1 为基线）
 warm-up ≥ 1 次
 repeat = 3~5 次
 ```
@@ -447,10 +473,44 @@ repeat = 3~5 次
 
 ```text
 tools/
-  bench_common.py       # prompt 生成、统计（均值/中位数/P95）、JSON schema
+  data_collector/       # 仓库原生能力评测集采集与判分入口
+  bench_common.py       # 客户端计时、统计（均值/中位数/P95）、JSON schema
   bench_splash.py       # Splash 18080/18081 适配器
   bench_mlxvlm.py       # MLX-VLM 18091 适配器
+  bench_multi_query.py  # 能力集并发阶梯多 query
+  monitor_machine.py    # CPU/GPU/NPU/内存/算力/带宽实时监控
   summarize.py          # 分引擎汇总 Markdown 与图表
+```
+
+### 5.9 仓库原生能力评测集与并发多 Query 口径（v5 新增）
+
+正式 query 使用仓库原生能力评测集，不再使用 `benchmark_data/performance/` 性能 workload：
+
+| dataset_id | 数据文件 | 全量条数 | 判分方式 |
+|---|---|---:|---|
+| `gpqa` | `data/GPQA/gpqa_diamond.json` | 198 | 选项匹配 |
+| `mmlupro` | `data/MMLUPro/test.json` | 1001 | 选项匹配 |
+| `math500` | `data/MATH500/test.json` | 500 | 答案抽取 + 数学判分 |
+| `arcc` | `data/arc_c/arc_test.json` | 1172 | 选项匹配 |
+| `gsm8k` | `data/GSM8K/test.json` | 100 | 数值匹配 |
+| `mmlu` | `data/MMLU/test.json` | 182 | 选项匹配 |
+
+以上文件是 JSONL（扩展名仍为 `.json`）。配置入口为 `config/edge_router_config.yaml` 的 `datasets` 段，`dataset_id` + `splits: [test]`。三个模型共用同一批能力 query，按 `(dataset_id, record_index)` 严格对齐；本轮既记录性能与机器资源，也保留仓库 evaluator 的判分结果。
+
+并发阶梯：
+
+```text
+concurrency = 1 → 2 → 4 → 8 → 16
+```
+
+每档先预热，再重复下发同一批能力 query；客户端记录 per-request TTFT/E2E/completion tokens/`finish_reason`，并汇总该档请求吞吐、成功 token 吞吐、排队时间和错误率。Splash `--queue-size` 与 MLX-VLM `--max-num-seqs` 按当前档位设置；若某档出现 OOM、严重排队、swap 暴涨或雪崩，停止升档并保留上一档为该机器/模型下的稳定最大并发。**不同并发档位的数据分表、分图，不得混算。**
+
+运行方式：
+
+```bash
+python tools/monitor_machine.py --duration 3600 --interval 2   --out results/mac_benchmark/monitor/<model_tag> --chart
+
+python tools/bench_multi_query.py   --model 'mlx-community/Qwen3.6-35B-A3B-4bit'   --port 18081   --limit-per-dataset 0   --concurrency 1,2,4,8,16   --out results/mac_benchmark/multi_query/<model_tag>
 ```
 
 ---
@@ -461,7 +521,7 @@ tools/
 
 - 同一引擎、同一机器、同一量化精度下的模型（表 A vs 表 B）；
 - 同一输入/输出长度下的 TTFT / Prefill / Decode；
-- 同一上下文阶梯下的峰值内存与稳定性；
+- 同一能力 query 长度桶与并发档位下的峰值内存与稳定性；
 - 同一 warm-up 与重复次数后的统计分布。
 
 ### 6.2 不应横向比较
@@ -485,9 +545,9 @@ tools/
 
 | 因素 | 对 Prefill 的影响 | 对 Decode 的影响 | 本轮如何测量 |
 |---|---|---|---|
-| 内存带宽 | 高 | **很高，通常 Decode 主瓶颈** | 同模型同引擎同上下文对比 tok/s |
-| GPU 核数与架构 | **很高（主瓶颈）** | 中高 | M5 Pro 单机内不同模型/上下文对比 |
-| 统一内存容量 | 中 | 高（决定 KV 上限） | 上下文阶梯 OOM 点 |
+| 内存带宽 | 高 | **很高，通常 Decode 主瓶颈** | 同模型同引擎同能力 query 长度桶对比 tok/s |
+| GPU 核数与架构 | **很高（主瓶颈）** | 中高 | M5 Pro 单机内不同模型/能力 query 对比 |
+| 统一内存容量 | 中 | 高（决定 KV 上限） | 能力集长题 OOM 点 |
 | KV 精度与实现 | 中 | 高 | `--kv-format int8` 全程固定 |
 | DFlash2 投机解码 | 低 | **高（Splash 特有）** | 记录 draft 对 Decode 的影响，表 A/B 单独标注 |
 | expert-memory 槽位 | 中 | 高 | Splash `--expert-memory`；不足时专家走 SSD |
@@ -514,7 +574,7 @@ sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；
 1. **Decode 瓶颈**：各模型 Decode tok/s 与内存带宽的关系；DFlash2 带来多少加速；
 2. **Prefill 瓶颈**：不同输入长度下 TTFT 与 Prefill tok/s 如何变化；
 3. **内存瓶颈**：权重、DFlash2、KV Cache、Metal 缓冲各占多少；是否 swap；
-4. **上下文上限**：128K 是否稳定通过；失败发生在加载、Prefill 还是 Decode；256K 探测结果；
+4. **能力集稳定性**：每个 dataset 与并发档位是否稳定通过；失败发生在加载、Prefill 还是 Decode；长题探测结果单独记录；
 5. **SSD 流式**：是否出现专家/权重流式读取，与 `--expert-memory`/`--max-memory` 的关系；
 6. **稳定性**：重复测试均值、中位数、P95 和最差一次，不只报最好成绩。
 
@@ -573,30 +633,57 @@ sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；
 
 所有 `null` 正式运行后替换为实测值；缺失字段不补 0、不估算。MLX-VLM 的行用 `engine: "mlx-vlm"`、`draft_model: null`、`kv_format: null`。
 
-### 8.2 分引擎汇总表（v4 强制）
+并发多 Query 能力评测结果（`tools/bench_multi_query.py` 的 `stage_<c>_requests.jsonl`）新增以下端侧评测字段：
 
-**表 A — Splash 1.5.0 / Qwen3.8-27B（GGUF Q4_K_M + DFlash2 + INT8 KV）：**
+```text
+sample_id / eval_name / model_name / prompt / response
+correct / predicted_answer / gold_answer / fail_reason
+prompt_tokens / completion_tokens / reasoning_tokens
+prefill_tokens / decode_tokens / prefill_tps / decode_tps
+request_start_time / first_token_time / response_end_time
+server_wall_s / client_e2e_s
+cache_status / cache_hit_tokens / error / retry_count
 
-| 上下文 | cold load | TTFT | Prefill tok/s | Decode tok/s | 峰值 RSS | wired | swap | SSD 读 | 成功 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 1K | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 8K | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 32K | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 64K | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 128K | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 256K（探测） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+run_id / host / engine / engine_version
+weight_format / quantization / draft_model
+kv_format / state_format / model_revision_or_digest
+attempt_index / backoff_s / timeout_setting_s
+error_type / http_status
+per_request_machine.memory_used_gib / memory_free_gib / wired_gib / swap_used_mib
+```
+
+其中 `request_*` 使用 ISO 时间戳；耗时字段另用客户端 `time.monotonic()` 计算并写入 `client_e2e_s`，不能混用壁钟。
+
+### 8.2 分引擎汇总表（v5 强制）
+
+每个并发档位（1/2/4/8/16）复制一份本表，命名为表 A-c1、表 A-c2 …… 表 A-c16；**不同档位数据分表，不混算**。CPU/GPU/NPU、算力、带宽等机器指标随档位由 `monitor_machine.py` 输出时间序列图（见 8.3 图 6～9），不在本表重复列。
+
+**表 A — Splash 1.5.0 / Qwen3.8-27B（GGUF Q4_K_M + DFlash2 + INT8 KV，单档模板）：**
+
+| 能力评测集 | 条数 | cold load | TTFT | Prefill tok/s | Decode tok/s | 峰值 RSS | wired | swap | SSD 读 | 错误/超时 | 成功 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| GPQA | 198 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| MMLU | 182 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| MMLU-Pro | 1001 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| MATH500 | 500 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| ARC-C | 1172 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| GSM8K | 100 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 表 B（Splash / Qwen3.6-35B-A3B，MLX 4bit + DFlash2）与表 C（MLX-VLM 0.8.0 / Gemma-4-26B-A4B，MLX 4bit）用同一模板。**三表不合并排名；跨引擎只做观察性对比并显式标注引擎差异。**
 
-**表 D（第二轮实验性）**：Splash / Qwen3.8-Flash-Next 低比特，缩减矩阵 1K/8K + 32K 探测，单列输出，不与第一轮排名；启动参数 `--expert-memory` / `--ple-memory` / `--sparse-kv-memory` 必须逐次记录。
+**表 D（第二轮实验性）**：Splash / Qwen3.8-Flash-Next 低比特，使用能力评测集短-中长度题做并发探测，较长题单独探测，单列输出，不与第一轮排名；启动参数 `--expert-memory` / `--ple-memory` / `--sparse-kv-memory` 必须逐次记录。
 
 ### 8.3 图表输出
 
 - 图 1：TTFT 与 Prefill tok/s 随输入长度变化（分引擎曲线）；
 - 图 2：Decode tok/s 随输出长度变化（分引擎曲线）；
-- 图 3：峰值内存（RSS + wired）与 KV 增量随上下文变化，标记 OOM/256K 探测点；
+- 图 3：峰值内存（RSS + wired）与 KV 增量随能力 query 长度桶变化，标记 OOM/长题探测点；
 - 图 4：同引擎内模型对比（表 A vs 表 B）；
-- 图 5：SSD 读取速率与上下文/`--max-memory` 的关系。
+- 图 5：SSD 读取速率与上下文/`--max-memory` 的关系；
+- 图 6：CPU 使用率随时间与并发档位变化（占用/总核）；
+- 图 7：GPU/NPU duty/功率随时间与并发档位变化；
+- 图 8：内存 used/free/cache/available 与 swap 随时间变化；
+- 图 9：吞吐与算力（TFLOPS/PFLOPS）随并发档位变化，标注量化单位。
 
 图表保存到：`/Users/augustus/Desktop/LLMBenchmark/results/mac_benchmark/charts/`
 
@@ -638,8 +725,8 @@ sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；
 执行配置命名区分"模型身份"与"执行节点/引擎/量化/上下文"，例如：
 
 ```text
-Qwen3.8-27B-Splash-Q4KM-DFlash2-INT8KV-32K-Jiuwen35
-Gemma-4-26B-A4B-MLXVLM-4bit-32K-Jiuwen35
+Qwen3.8-27B-Splash-Q4KM-DFlash2-INT8KV-GPQA-Jiuwen35
+Gemma-4-26B-A4B-MLXVLM-4bit-MMLU-Jiuwen35
 ```
 
 ---
@@ -652,23 +739,23 @@ Gemma-4-26B-A4B-MLXVLM-4bit-32K-Jiuwen35
 - [ ] 协商停止 NVIDIA PAIR 模型负载、Ollama Qwen3.6（约 30GiB）、MLX-LM 9B（约 5GiB）；
 - [ ] 确认 `18080`、`18081`、`18091` 无冲突；
 - [ ] 记录 `vm_stat`、`memory_pressure`、swap、磁盘空间基线；
-- [ ] Qwen3.8 Splash 8K smoke test：`/ready`、`/status`、chat completion、日志正常；
-- [ ] 固定模型 revision、量化、KV、上下文、生成参数并写入配置。
+- [ ] Qwen3.8 Splash smoke test：`/ready`、`/status`、chat completion、日志正常；
+- [ ] 固定模型 revision、量化、KV、能力评测集、生成参数并写入配置。
 
-### P1：Splash 模型（表 A/B）
+### P1a：Splash 模型（表 A/B）
 
-- [ ] Qwen3.8-27B：1K/8K/32K/64K/128K 矩阵；
-- [ ] Qwen3.8-27B：256K 单独探测；
+- [ ] Qwen3.8-27B：六类能力评测集 + 并发阶梯；
+- [ ] Qwen3.8-27B：长输入能力题单独探测；
 - [ ] 下载并校验 Qwen3.6 DFlash2（固定 revision）；
-- [ ] Qwen3.6-35B-A3B：同一矩阵 + 256K 探测；
+- [ ] Qwen3.6-35B-A3B：同一能力集与并发阶梯 + 长题探测；
 - [ ] 记录 DFlash2 对 Decode 的影响；
 - [ ] 记录 expert/权重是否发生 SSD 流式读取。
 
-### P1：Gemma MLX（表 C）
+### P1b：Gemma MLX（表 C）
 
 - [ ] Gemma-4-26B-A4B CLI smoke test；
-- [ ] 固定 `--max-num-seqs 1`；
-- [ ] 1K/8K/32K/64K/128K 矩阵 + 256K 探测；
+- [ ] `--max-num-seqs` 按并发档位设置（冒烟与冷加载固定 1）；
+- [ ] 六类能力评测集 + 并发阶梯 + 长题探测；
 - [ ] 记录 peak memory、RSS、wired、swap；
 - [ ] 标注 `engine=MLX-VLM 0.8.0`。
 
@@ -676,7 +763,8 @@ Gemma-4-26B-A4B-MLXVLM-4bit-32K-Jiuwen35
 
 - [ ] 按引擎分表（A/B/C）；
 - [ ] 同引擎内比较模型；跨引擎只做观察；
-- [ ] 报告冷加载、TTFT、Prefill、Decode、内存、上下文稳定性、SSD 读取；
+- [ ] 报告冷加载、TTFT、Prefill、Decode、内存、能力集稳定性、SSD 读取；
+- [ ] 输出每个并发档位的 CPU/GPU/NPU、内存、算力、带宽原始采样与图表；
 - [ ] 保存原始日志、命令、模型 revision 和测试日期；
 - [ ] 异常样本单独说明，不删除失败记录。
 
@@ -684,7 +772,7 @@ Gemma-4-26B-A4B-MLXVLM-4bit-32K-Jiuwen35
 
 - [ ] 低比特权重下载、文件大小与哈希校验（未就绪则推迟）；
 - [ ] Splash 启动并逐次记录 `--expert-memory` / `--ple-memory` / `--sparse-kv-memory`；
-- [ ] 缩减矩阵 1K/8K 正式尝试 + 32K 单独探测；
+- [ ] 能力题缩减集并发探测 + 长题单独探测；
 - [ ] 表 D 单独输出，标注实验性口径，不参与任何排名。
 
 ---
@@ -710,7 +798,7 @@ Gemma 配置为 `Gemma4ForConditionalGeneration` / `gemma4`（text：`gemma4_tex
 
 ### 11.3 测试注意
 
-- 正式测试固定 `--max-num-seqs 1`（防并发污染）、`temperature=0`；
+- `--max-num-seqs` 按并发档位设置（冒烟与冷加载固定 1，防并发污染）、`temperature=0`；
 - 结果标签写清 `MLX-VLM 0.8.0 + MLX 4bit affine`，不要只写"Gemma 性能"；
 - 不能把 MLX 结果填进 Splash 表，也不能用 Gemma 的 tok/s 与 Qwen 的 Splash tok/s 直接排名。
 
@@ -735,4 +823,5 @@ Gemma 配置为 `Gemma4ForConditionalGeneration` / `gemma4`（text：`gemma4_tex
 ### 12.2 历史版本说明
 
 - **v3（2026-11-23）及更早**：Ollama 统一基线 + MLX-LM 性能专项 + 三机（3.5/3.13/3.7）对比口径，原文见 git 历史（commit `0e76b3d`）；其中 Ollama 部署细节、Gemma Ollama 选型、3.7 oMLX 缓存分析等内容随引擎口径切换不再维护。
-- **v4（2026-11-24，本版）**：切换为 Splash 1.5.0 + MLX-VLM 0.8.0 双引擎、3.5 单机独占、分表对比口径。部署细节的完整实机核查证据见 [Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md](./Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md)。
+- **v4（2026-11-24）**：切换为 Splash 1.5.0 + MLX-VLM 0.8.0 双引擎、3.5 单机独占、分表对比口径。部署细节的完整实机核查证据见 [Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md](./Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md)。
+- **v5（2026-11-24，本版）**：评测集切换为仓库原生能力评测集，正式口径改为并发阶梯（1→2→4→8→16），新增机器指标（CPU/GPU/NPU、内存、算力、带宽）全程实时监控；8.2 汇总表按并发档位分表。

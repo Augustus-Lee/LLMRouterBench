@@ -56,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contexts", type=_parse_contexts,
                         default=list(DEFAULT_CONTEXT_LADDER),
                         help="逗号分隔上下文阶梯，默认 1K/8K/32K/64K/128K")
+    parser.add_argument("--workload-file", default=None,
+                        help="由 tools/build_perf_workload.py 生成的模型专属 JSONL；"
+                             "提供后按 target_tokens 与 --contexts 过滤并逐条执行")
     parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
