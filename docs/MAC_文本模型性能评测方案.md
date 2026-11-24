@@ -505,6 +505,16 @@ concurrency = 1 → 2 → 4 → 8 → 16
 
 每档先预热，再重复下发同一批能力 query；客户端记录 per-request TTFT/E2E/completion tokens/`finish_reason`，并汇总该档请求吞吐、成功 token 吞吐、排队时间和错误率。Splash `--queue-size` 与 MLX-VLM `--max-num-seqs` 按当前档位设置；若某档出现 OOM、严重排队、swap 暴涨或雪崩，停止升档并保留上一档为该机器/模型下的稳定最大并发。**不同并发档位的数据分表、分图，不得混算。**
 
+本地模型配置与入口：
+
+```bash
+# 从 config/local_model_eval.yaml 启动
+/Users/augustus/miniconda3/bin/python tools/run_local_bench.py   --model-name qwen3.8-27b --limit-per-dataset 0
+
+# 汇总并成图
+/Users/augustus/miniconda3/bin/python tools/summarize_multi_query.py   --result-dir results/mac_benchmark/multi_query/qwen3.8-27b   --chart
+```
+
 运行方式：
 
 ```bash

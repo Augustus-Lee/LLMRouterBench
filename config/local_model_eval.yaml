@@ -1,0 +1,95 @@
+# 本地端侧模型评测配置
+#
+# 本配置仅用于 tools/bench_multi_query.py 的能力评测 + 并发阶梯性能测试。
+# 当前阶段不通过 data_collector 云端 API 跑这些本地模型。
+#
+# 使用方式：
+#   1. 先按 service_command 启动对应模型的本地推理服务；
+#   2. 再根据 models[*].port / api_model_name 等字段拼 bench_multi_query 参数；
+#   3. 测完一个模型后完整退出进程，再启动下一个模型。
+
+run_defaults:
+  datasets: [gpqa, mmlupro, math500, arcc, gsm8k, mmlu]
+  limit_per_dataset: 0          # 0 表示全量
+  concurrency: [1, 2, 4, 8, 16]
+  repeat: 2
+  warmup: 1
+  mode: both
+  max_output_tokens: 256
+  temperature: 0.0
+  top_p: 1.0
+  seed: 42
+  max_attempts: 3
+  backoff_base_s: 1.0
+  per_request_machine_metrics: false
+  monitor_interval_s: 2
+
+models:
+  - name: qwen3.8-27b
+    api_model_name: "Qwen/Qwen3.8-27B"
+    engine: splash
+    engine_version: "1.5.0"
+    host: "127.0.0.1"
+    port: 18080
+    weight_format: gguf
+    quantization: "Q4_K_M"
+    draft_model: "Qwen3.8-27B-DFlash2"
+    kv_format: int8
+    state_format: bf16
+    model_revision_or_digest: "local-UD-Q4_K_M"
+    weight_path: "/Users/jiuwen/Models/splash/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"
+    draft_path: "/Users/jiuwen/Models/splash/Qwen3.8-27B-DFlash2"
+    mmproj_path: "/Users/jiuwen/Models/splash/Qwen3.8-27B-GGUF/mmproj-BF16.gguf"
+    service_command: >-
+      /opt/homebrew/bin/splash serve
+      --model "Qwen/Qwen3.8-27B"
+      --model-dir "/Users/jiuwen/Models/splash/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"
+      --draft-model "/Users/jiuwen/Models/splash/Qwen3.8-27B-DFlash2"
+      --language-only --offline --host 127.0.0.1 --port 18080
+      --max-memory 40G --kv-format int8 --state-format bf16
+      --verify-rows all --queue-size 1 --request-timeout 30m --idle-release 10m
+
+  - name: qwen3.6-35b-a3b
+    api_model_name: "mlx-community/Qwen3.6-35B-A3B-4bit"
+    engine: splash
+    engine_version: "1.5.0"
+    host: "127.0.0.1"
+    port: 18081
+    weight_format: mlx
+    quantization: "4bit-affine"
+    draft_model: "Qwen3.6-35B-A3B-DFlash2"
+    kv_format: int8
+    state_format: bf16
+    model_revision_or_digest: "local-mlx-4bit"
+    weight_path: "/Users/jiuwen/Models/Qwen3.6-35B-A3B-4bit"
+    draft_path: "/Users/jiuwen/Models/splash/Qwen3.6-35B-A3B-DFlash2"
+    mmproj_path: null
+    service_command: >-
+      /opt/homebrew/bin/splash serve
+      --model "mlx-community/Qwen3.6-35B-A3B-4bit"
+      --model-dir "/Users/jiuwen/Models/Qwen3.6-35B-A3B-4bit"
+      --draft-model "/Users/jiuwen/Models/splash/Qwen3.6-35B-A3B-DFlash2"
+      --language-only --offline --host 127.0.0.1 --port 18081
+      --max-memory 42G --kv-format int8 --state-format bf16
+      --verify-rows all --queue-size 1 --request-timeout 30m --idle-release 10m
+
+  - name: gemma-4-26b-a4b
+    api_model_name: "/Users/jiuwen/Models/gemma-4-26b-a4b-it-4bit"
+    engine: mlx-vlm
+    engine_version: "0.8.0"
+    host: "127.0.0.1"
+    port: 18091
+    weight_format: mlx
+    quantization: "4bit-affine"
+    draft_model: null
+    kv_format: null
+    state_format: null
+    model_revision_or_digest: "local-mlx-4bit"
+    weight_path: "/Users/jiuwen/Models/gemma-4-26b-a4b-it-4bit"
+    draft_path: null
+    mmproj_path: null
+    service_command: >-
+      /Users/jiuwen/mlx-bench-venv/bin/mlx_vlm.server
+      --host 127.0.0.1 --port 18091
+      --model "/Users/jiuwen/Models/gemma-4-26b-a4b-it-4bit"
+      --max-tokens 2048 --max-num-seqs 1 --log-level INFO

@@ -167,6 +167,16 @@ python tools/bench_multi_query.py   --model 'mlx-community/Qwen3.6-35B-A3B-4bit'
 
 并发多 Query 测量时，以 `(dataset_id, record_index)` 严格对齐；每个模型共用同一批能力 query，不要与历史 882 题矩阵或其他抽样混用。
 
+本地模型配置与入口：
+
+```bash
+# 从 config/local_model_eval.yaml 启动
+/Users/augustus/miniconda3/bin/python tools/run_local_bench.py   --model-name qwen3.8-27b --limit-per-dataset 0
+
+# 汇总并成图
+/Users/augustus/miniconda3/bin/python tools/summarize_multi_query.py   --result-dir results/mac_benchmark/multi_query/qwen3.8-27b   --chart
+```
+
 ### 6.3 解释边界
 
 - 这些数据集带标准答案，可同时报告能力准确率与性能指标；
