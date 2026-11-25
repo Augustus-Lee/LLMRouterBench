@@ -11,6 +11,7 @@ from tools.bench_accuracy_concurrency import (  # noqa: E402
     build_queries,
     compute_stage_summary,
     make_request_record,
+    make_workload_event,
     parse_concurrency,
     per_dataset_accuracy,
     build_parser,
@@ -130,6 +131,61 @@ class TestComputeStageSummary(unittest.TestCase):
         self.assertAlmostEqual(per_dataset_accuracy(reqs)["gpqa"]["accuracy"], 1.0)
         self.assertAlmostEqual(per_dataset_accuracy(reqs)["mmlu"]["accuracy"], 0.0)
 
+    def test_phase_effective_compute_and_bandwidth(self):
+        reqs = [
+            {"success": True, "is_correct": True, "dataset_id": "gpqa",
+             "prompt_tokens": 1000, "completion_tokens": 100,
+             "ttft_s": 0.2, "decode_tok_per_s": 20.0},
+        ]
+        s = compute_stage_summary(
+            reqs, wall_s=10.0, concurrency=1,
+            theoretical_tflops=100.0,
+            official_bandwidth_gb_s=200.0,
+            prefill_flops_per_token=2e9,
+            decode_flops_per_token=4e9,
+            prefill_bytes_per_token=1e9,
+            decode_bytes_per_token=2e9,
+        )
+        self.assertAlmostEqual(s["input_tokens_per_s"], 100.0)
+        self.assertAlmostEqual(s["output_tokens_per_s"], 10.0)
+        self.assertAlmostEqual(s["prefill_effective_tflops"], 0.2)
+        self.assertAlmostEqual(s["decode_effective_tflops"], 0.04)
+        self.assertAlmostEqual(s["effective_tflops"], 0.24)
+        self.assertAlmostEqual(s["prefill_effective_bandwidth_gb_s"], 100.0)
+        self.assertAlmostEqual(s["decode_effective_bandwidth_gb_s"], 20.0)
+        self.assertAlmostEqual(s["effective_bandwidth_gb_s"], 120.0)
+        self.assertAlmostEqual(s["tflops_utilization"], 0.0024)
+        self.assertAlmostEqual(s["bandwidth_utilization"], 0.6)
+
+    def test_missing_compute_inputs_stay_null(self):
+        reqs = [{"success": True, "is_correct": True, "dataset_id": "gpqa",
+                 "prompt_tokens": 1000, "completion_tokens": 100}]
+        s = compute_stage_summary(reqs, wall_s=10.0, concurrency=1)
+        self.assertIsNone(s["prefill_effective_tflops"])
+        self.assertIsNone(s["decode_effective_tflops"])
+        self.assertIsNone(s["effective_tflops"])
+        self.assertIsNone(s["prefill_effective_bandwidth_gb_s"])
+        self.assertIsNone(s["effective_bandwidth_gb_s"])
+
+
+class TestWorkloadEvent(unittest.TestCase):
+    def test_successful_request_has_token_and_phase_timing_fields(self):
+        record = {
+            "success": True, "mode": "stream", "prompt_tokens": 100,
+            "completion_tokens": 20, "ttft_s": 0.25, "e2e_s": 1.25,
+        }
+        event = make_workload_event(record, concurrency=4, wall_time=123.5)
+        self.assertEqual(event["wall_time"], 123.5)
+        self.assertEqual(event["concurrency"], 4)
+        self.assertEqual(event["prompt_tokens"], 100)
+        self.assertEqual(event["completion_tokens"], 20)
+        self.assertEqual(event["ttft_s"], 0.25)
+
+    def test_failed_request_is_not_counted_as_workload(self):
+        record = {"success": False, "prompt_tokens": None,
+                  "completion_tokens": None}
+        self.assertIsNone(make_workload_event(record, concurrency=1, wall_time=1.0))
+
 
 class TestParseConcurrency(unittest.TestCase):
     def test_csv(self):
@@ -147,6 +203,11 @@ class TestParserDefaults(unittest.TestCase):
         self.assertEqual(args.repeat, 1)
         self.assertEqual(args.limit_per_dataset, 0)
         self.assertEqual(args.max_attempts, 3)
+        self.assertIsNone(args.live_counters_file)
+        self.assertEqual(args.workload_window_s, 15.0)
+        self.assertIsNone(args.theoretical_tflops)
+        self.assertIsNone(args.prefill_flops_per_token)
+        self.assertIsNone(args.decode_bytes_per_token)
 
 
 if __name__ == "__main__":

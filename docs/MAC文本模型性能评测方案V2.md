@@ -4,7 +4,8 @@
 > 评测范围：第一轮为三个本地量化文本模型的单模型推理性能；第二轮为 Qwen3.8-Flash-Next 实验性探测（125B-A6B，低比特 / SSD 流式）  
 > 推理引擎：Splash 1.5.0（Qwen 系）+ MLX-VLM 0.8.0（Gemma）  
 > 编制日期：2026-11-24  
-> 本次修订：评测集改为仓库原生能力评测集（GPQA、MMLU、MMLU-Pro、MATH500、ARC-C、GSM8K）；正式口径为相同 query 的并发阶梯式上涨（1→2→4→8→16），并在全过程实时监控 CPU/GPU/NPU 使用率、内存、算力与带宽，输出机器指标时间序列图。
+> 本次修订：评测集改为仓库原生能力评测集（GPQA、MMLU、MMLU-Pro、MATH500、ARC-C、GSM8K）；正式口径为相同 query 的并发阶梯式上涨（1→2→4→8→16），并在全过程实时监控 CPU/GPU/NPU、内存硬件状态，并由已完成请求 token 吞吐推导有效算力与有效带宽，输出机器指标时间序列图。
+> 算力/带宽实时监控口径详见：[MAC_算力带宽实时监控接入.md](./MAC_算力带宽实时监控接入.md)
 
 ## 1. 结论摘要
 
@@ -70,11 +71,11 @@ Gemma 的架构为 `gemma4` / `gemma4_text`，Splash 1.5.0 不支持，不能通
 | swap delta | 测试前后 swap 增量 |
 | SSD I/O | 读写速率和总量，使用 `iostat`，判断权重或专家是否流式读取 |
 | 稳定性 | error、timeout、`finish_reason`、重复重启和日志异常 |
-| GPU / NPU 使用率 | Apple 统一 GPU 与 ANE 的 duty cycle / 频率 / 功率，口径为“占用/总量”；有 sudo 时 `powermetrics --samplers gpu_power,ane_power`，无 sudo 显式标记“未采集” |
+| GPU / NPU 使用率 | Apple 统一 GPU 与 ANE 的 duty cycle / 频率 / 功率，口径为“占用/总量”；有 sudo 时 `powermetrics --samplers gpu_power,ane_power,thermal`，无 sudo 显式标记“未采集” |
 | CPU 使用率 | 各核心 user/sys/idle/nice 比例，记录“占用核数/总核数”；`top -l`、`ps`，可选 `powermetrics --samplers cpu_power` |
 | 内存（含统一内存） | RAM 已用/空闲/缓存/可用，进程 RSS，swap；`vm_stat`、`sysctl hw.memsize`、`memory_pressure`、`sysctl vm.swapusage` |
-| 算力（TFLOPS / PFLOPS） | 必须记录模型量化单位/`weight_format`；由参数规模与实测 token/时间换算有效浮点吞吐，理论峰值与实测分列，禁止直接把模型参数当作实测算力 |
-| GPU / NPU 带宽 | 官方理论值（按规格，如 120GB/s）与实测带宽；实测带宽须用内存带宽核验，不得用 tok/s 代替 |
+| 算力（TFLOPS / PFLOPS） | 硬件实时状态记录 GPU/NPU active frequency；`effective_tflops` 由 Prefill/Decode token 吞吐与显式 FLOPs/token 推导，理论峰值与有效值分列，禁止直接把模型参数当作实测算力 |
+| GPU / NPU 带宽 | `powermetrics` 不能直接读取 GPU/NPU 物理总线带宽计数器；`effective_bandwidth_gb_s` 由 Prefill/Decode token 吞吐与显式 bytes/token 推导，官方理论带宽仅作利用率分母，不得把推导值冒充硬件计数器 |
 
 每个场景预热至少 1 次，正式重复 3～5 次，报告均值、中位数、P95 和最差值。失败样本必须保留；引擎未返回的字段记为 `null`，不得补 0 或估算。
 
@@ -157,12 +158,34 @@ python -m data_collector.cli list
 python -m data_collector.cli run config/edge_router_config.yaml -y
 ```
 
-并发阶梯多 Query 性能测量（另开一个窗口运行机器监控）：
+并发阶梯多 Query 性能测量（另开窗口运行 `powermetrics` 与机器监控；monitor 与 bench 必须指向同一个绝对路径 workload JSONL）：
 
 ```bash
-python tools/monitor_machine.py --duration 3600 --interval 2   --out results/mac_benchmark/monitor/<model_tag> --chart
+# 窗口 1：实时硬件采样（需 sudo；无权限标“未采集”）
+sudo powermetrics --samplers cpu_power,gpu_power,ane_power,thermal -i 2000 \
+  -o /Users/jiuwen/powermetrics_<model_tag>.txt
 
-python tools/bench_multi_query.py   --model 'mlx-community/Qwen3.6-35B-A3B-4bit'   --port 18081   --limit-per-dataset 0   --concurrency 1,2,4,8,16   --out results/mac_benchmark/multi_query/<model_tag>
+# 窗口 2：硬件状态 + workload 有效算力/有效带宽实时监控
+python tools/monitor_machine.py \
+  --duration 21600 --interval 2 \
+  --powermetrics-file /Users/jiuwen/powermetrics_<model_tag>.txt --follow-powermetrics \
+  --workload-counters-file /Users/jiuwen/LLMBenchmark/results/mac_benchmark/monitor/<model_tag>/workload_counters.jsonl \
+  --workload-window-s 15 \
+  --theoretical-tflops <理论峰值，可为空> --official-bandwidth-gb-s <官方带宽，可为空> \
+  --prefill-flops-per-token <每输入 token FLOPs> --decode-flops-per-token <每输出 token FLOPs> \
+  --prefill-bytes-per-token <每输入 token 字节数> --decode-bytes-per-token <每输出 token 字节数> \
+  --out results/mac_benchmark/monitor/<model_tag> --chart
+
+# 窗口 3：并发阶梯权威准确率 + 阶段有效算力/带宽 + 写入 live counters
+python tools/bench_accuracy_concurrency.py \
+  --engine splash --host 127.0.0.1 --port 18080 \
+  --concurrency 1,2,4,8,16 --mode both --max-output-tokens 2048 \
+  --live-counters-file /Users/jiuwen/LLMBenchmark/results/mac_benchmark/monitor/<model_tag>/workload_counters.jsonl \
+  --workload-window-s 15 \
+  --theoretical-tflops <理论峰值，可为空> --official-bandwidth-gb-s <官方带宽，可为空> \
+  --prefill-flops-per-token <值> --decode-flops-per-token <值> \
+  --prefill-bytes-per-token <值> --decode-bytes-per-token <值> \
+  --out results/mac_benchmark/accuracy/<model_tag>
 ```
 
 并发多 Query 测量时，以 `(dataset_id, record_index)` 严格对齐；每个模型共用同一批能力 query，不要与历史 882 题矩阵或其他抽样混用。
@@ -230,9 +253,9 @@ Splash 固定 `--language-only`、`--offline`、`--kv-format int8`、`--state-fo
 
 ### 8.3 资源采样与结果结构
 
-同步采集推理进程 RSS、wired、swap、SSD 读写、CPU/GPU/温控状态和 error/timeout/finish_reason，并按并发档位分面保存时间序列。机器指标至少包括：CPU 使用率（占用/总核）、GPU/NPU 使用率（`powermetrics --samplers gpu_power,ane_power`；无 sudo 标“未采集”）、内存 used/free/cache/available、算力（量化单位 + TFLOPS/PFLOPS）与 GPU/NPU 带宽（理论值与实测值分列）。`powermetrics` 等命令无 sudo 权限时标记“未采集”，不得用推测值补齐。
+同步采集推理进程 RSS、wired、swap、SSD 读写、CPU/GPU/温控状态和 error/timeout/finish_reason，并按并发档位分面保存时间序列。机器指标至少包括：CPU 使用率（占用/总核）、GPU/NPU 使用率（`powermetrics --samplers gpu_power,ane_power,thermal`；无 sudo 标“未采集”）、内存 used/free/cache/available，以及由 workload token 吞吐推导的有效算力（TFLOPS）与有效带宽（GB/s）。理论峰值与有效值分列，推导值不得冒充硬件计数器。`powermetrics` 等命令无 sudo 权限时标记“未采集”，不得用推测值补齐。
 
-同时生成机器指标图表：每档并发输出 CPU 使用率曲线、GPU/NPU duty/功率曲线、内存占用曲线、吞吐/算力曲线；图表与 JSON 原始采样同目录保存，图与数必须成组更新。
+同时生成机器指标图表：每档并发输出 CPU 使用率曲线、GPU/NPU duty/功率曲线、内存占用曲线、吞吐/有效算力/有效带宽曲线；图表与 JSON 原始采样同目录保存，图与数必须成组更新。
 
 每轮实验保存三层 fingerprint：
 
@@ -250,8 +273,9 @@ tools/
   bench_common.py       # 客户端计时、统计、JSON schema
   bench_splash.py       # Splash 18080/18081
   bench_mlxvlm.py       # MLX-VLM 18091
-  bench_multi_query.py  # 能力集并发阶梯多 query
-  monitor_machine.py    # CPU/GPU/NPU/内存/算力/带宽实时监控
+  bench_multi_query.py  # 能力集并发阶梯多 query（兼容旧口径）
+  bench_accuracy_concurrency.py  # 并发阶梯权威准确率 + 阶段有效算力/带宽 + live counters
+  monitor_machine.py    # CPU/GPU/NPU/内存硬件状态 + workload 有效算力/有效带宽实时监控
   summarize.py          # 分引擎汇总、Markdown 和图表
 ```
 
@@ -329,7 +353,7 @@ tools/
 - [ ] 报告均值、中位数、P95 和最差值；
 - [ ] 每个能力数据集与并发档位是否稳定通过有明确记录；
 - [ ] 长输入能力题探测单独标记，不与常规能力评测结果混算；
-- [ ] 每个并发档位的 CPU/GPU/NPU、内存、算力、带宽原始采样与图表可追溯；
+- [ ] 每个并发档位的 CPU/GPU/NPU、内存硬件状态原始采样，以及有效算力/有效带宽的时间序列与图表可追溯；
 - [ ] Prefill、Decode、内存、swap、SSD 数据可追溯；
 - [ ] 失败样本保留并注明原因；
 - [ ] 分引擎输出表格和图表，不合并排名；

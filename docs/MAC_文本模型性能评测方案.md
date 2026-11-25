@@ -7,8 +7,9 @@
 > 核心原则：**不同推理引擎分表记录，不跨引擎直接排名**
 > 日期：2026-11-24（v5）
 > 本次修订依据：[Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md](./Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md)（2026-11-24，Splash/MLX-VLM 实机核查）
+> 算力/带宽实时监控口径详见：[MAC_算力带宽实时监控接入.md](./MAC_算力带宽实时监控接入.md)
 > 历史版本：v3 及更早版本（Ollama 统一基线 + MLX-LM 专项、三机对比口径）保留在 git 历史中，本版起不再维护该口径。
-> v5 修订：评测集改用仓库原生能力评测集（GPQA、MMLU、MMLU-Pro、MATH500、ARC-C、GSM8K）；正式口径为相同 query 的并发阶梯式上涨（1→2→4→8→16），并在全程实时监控 CPU/GPU/NPU 使用率、内存、算力和带宽并输出时间序列图。以上述修订与后文 v5 标注内容为准。
+> v5 修订：评测集改用仓库原生能力评测集（GPQA、MMLU、MMLU-Pro、MATH500、ARC-C、GSM8K）；正式口径为相同 query 的并发阶梯式上涨（1→2→4→8→16），并在全程实时监控 CPU/GPU/NPU、内存硬件状态，并由已完成请求的 token 吞吐推导有效算力与有效带宽，输出机器指标时间序列图。以上述修订与后文 v5 标注内容为准。
 
 ---
 
@@ -20,7 +21,7 @@
 |---|---|---|
 | 评测集 | 官方全量数据构造固定输入 | **仓库原生能力评测集：GPQA / MMLU / MMLU-Pro / MATH500 / ARC-C / GSM8K** |
 | 并发口径 | 单请求（`--queue-size 1`） | **并发阶梯 1→2→4→8→16，档位间分表分图，不混算** |
-| 机器监控 | 关键点手动采样 | **全程实时采样 CPU/GPU/NPU、内存、算力、带宽，输出时间序列图（图 6～9）** |
+| 机器监控 | 关键点手动采样 | **全程实时采样 CPU/GPU/NPU、内存硬件状态；由已完成请求 token 吞吐推导有效算力/有效带宽，输出时间序列图（图 6～9）** |
 | 汇总模板 | 单表汇总 | **按并发档位分表（表 A-c1…），并补"错误/超时"列** |
 
 ### 〇.2 v4 相对 v3 的关键变更
@@ -156,11 +157,11 @@ Decode Speed = completion_tokens / decode_duration   (tokens/sec)
 
 | 指标 | 定义 / 采集方式 |
 |---|---|
-| GPU / NPU 使用率 | Apple 统一 GPU 与 ANE 的 duty cycle / 频率 / 功率，口径为占用/总量；有 sudo 时使用 `powermetrics --samplers gpu_power,ane_power`，无 sudo 显式标记“未采集” |
+| GPU / NPU 使用率 | Apple 统一 GPU 与 ANE 的 duty cycle / 频率 / 功率，口径为占用/总量；有 sudo 时使用 `powermetrics --samplers gpu_power,ane_power,thermal`，无 sudo 显式标记“未采集” |
 | CPU 使用率 | 各核心 user/sys/idle/nice 比例，记录占用核数/总核数；`top -l`、`ps`、可选 `powermetrics --samplers cpu_power` |
 | 内存（含统一内存） | RAM 已用/空闲/缓存/可用、进程 RSS、swap；`vm_stat`、`sysctl hw.memsize`、`memory_pressure`、`sysctl vm.swapusage` |
-| 算力（TFLOPS / PFLOPS） | 必须记录模型量化单位/`weight_format`；由参数规模与实测 token/时间换算有效浮点吞吐，理论峰值与实测分列，禁止把模型参数直接当作实测算力 |
-| GPU / NPU 带宽 | 官方理论值（按规格记，如 120GB/s）与实测带宽；实测带宽须用内存带宽核验，不得用 tok/s 代替 |
+| 算力（TFLOPS / PFLOPS） | 硬件实时状态记录 GPU/NPU active frequency；`effective_tflops` 由 Prefill/Decode token 吞吐与显式 FLOPs/token 推导，理论峰值与有效值分列，禁止把模型参数直接当作实测算力 |
+| GPU / NPU 带宽 | `powermetrics` 不能直接读取 GPU/NPU 物理总线带宽计数器；`effective_bandwidth_gb_s` 由 Prefill/Decode token 吞吐与显式 bytes/token 推导，官方理论带宽仅作利用率分母，不得把推导值冒充硬件计数器 |
 
 这些指标按并发档位分面记录；“未采集”的字段标 `null`，不得用推测值补齐。
 
@@ -445,15 +446,15 @@ sysctl hw.memsize  # 统一内存总量，用于“占用/总量”口径
 iostat -w 1 -d disk0 60
 
 # CPU/GPU/NPU 实时采样（需要 sudo；无权限时标记“未采集”）
-sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 -n 60 \
+sudo powermetrics --samplers cpu_power,gpu_power,ane_power,thermal -i 1000 -n 60 \
   -o results/mac_benchmark/monitor/powermetrics.txt
 ```
 
-每档能力评测与并发同时记录：峰值 RSS、wired memory、swap 增量、SSD 读写速率、CPU/GPU/NPU、算力、带宽、error/timeout、finish_reason。
+每档能力评测与并发同时记录：峰值 RSS、wired memory、swap 增量、SSD 读写速率、CPU/GPU/NPU 硬件状态、有效算力、有效带宽、error/timeout、finish_reason。
 
 ### 5.7 能力评测集与固定参数
 
-正式 query 使用仓库原生能力评测集（见 5.9），不再按固定上下文阶梯构造输入。每个并发档位均记录：cold load time、TTFT、Prefill tok/s、Decode tok/s、`prompt_tokens`、`completion_tokens`、峰值 RSS、wired、swap、SSD 读写、CPU/GPU/NPU、算力、带宽、error、`finish_reason` 与判分结果。
+正式 query 使用仓库原生能力评测集（见 5.9），不再按固定上下文阶梯构造输入。每个并发档位均记录：cold load time、TTFT、Prefill tok/s、Decode tok/s、`prompt_tokens`、`completion_tokens`、峰值 RSS、wired、swap、SSD 读写、CPU/GPU/NPU 硬件状态、有效算力、有效带宽、error、`finish_reason` 与判分结果。
 
 固定参数：
 
@@ -477,8 +478,9 @@ tools/
   bench_common.py       # 客户端计时、统计（均值/中位数/P95）、JSON schema
   bench_splash.py       # Splash 18080/18081 适配器
   bench_mlxvlm.py       # MLX-VLM 18091 适配器
-  bench_multi_query.py  # 能力集并发阶梯多 query
-  monitor_machine.py    # CPU/GPU/NPU/内存/算力/带宽实时监控
+  bench_multi_query.py  # 能力集并发阶梯多 query（兼容旧口径）
+  bench_accuracy_concurrency.py  # 并发阶梯权威准确率 + 阶段有效算力/带宽 + live counters
+  monitor_machine.py    # CPU/GPU/NPU/内存硬件状态 + workload 有效算力/有效带宽实时监控
   summarize.py          # 分引擎汇总 Markdown 与图表
 ```
 
@@ -515,12 +517,34 @@ concurrency = 1 → 2 → 4 → 8 → 16
 /Users/augustus/miniconda3/bin/python tools/summarize_multi_query.py   --result-dir results/mac_benchmark/multi_query/qwen3.8-27b   --chart
 ```
 
-运行方式：
+运行方式（推荐按 1→2→3 顺序启动；`powermetrics`、monitor、bench 三方都使用绝对路径并指向同一个 workload JSONL）：
 
 ```bash
-python tools/monitor_machine.py --duration 3600 --interval 2   --out results/mac_benchmark/monitor/<model_tag> --chart
+# 窗口 1：实时硬件采样（需 sudo；无权限标“未采集”）
+sudo powermetrics --samplers cpu_power,gpu_power,ane_power,thermal -i 2000 \
+  -o /Users/jiuwen/powermetrics_<model_tag>.txt
 
-python tools/bench_multi_query.py   --model 'mlx-community/Qwen3.6-35B-A3B-4bit'   --port 18081   --limit-per-dataset 0   --concurrency 1,2,4,8,16   --out results/mac_benchmark/multi_query/<model_tag>
+# 窗口 2：硬件状态 + workload 有效算力/有效带宽实时监控
+python tools/monitor_machine.py \
+  --duration 21600 --interval 2 \
+  --powermetrics-file /Users/jiuwen/powermetrics_<model_tag>.txt --follow-powermetrics \
+  --workload-counters-file /Users/jiuwen/LLMBenchmark/results/mac_benchmark/monitor/<model_tag>/workload_counters.jsonl \
+  --workload-window-s 15 \
+  --theoretical-tflops <理论峰值，可为空> --official-bandwidth-gb-s <官方带宽，可为空> \
+  --prefill-flops-per-token <每输入 token FLOPs> --decode-flops-per-token <每输出 token FLOPs> \
+  --prefill-bytes-per-token <每输入 token 字节数> --decode-bytes-per-token <每输出 token 字节数> \
+  --out results/mac_benchmark/monitor/<model_tag> --chart
+
+# 窗口 3：并发阶梯权威准确率 + 阶段有效算力/带宽 + 写入 live counters
+python tools/bench_accuracy_concurrency.py \
+  --engine splash --host 127.0.0.1 --port 18080 \
+  --concurrency 1,2,4,8,16 --mode both --max-output-tokens 2048 \
+  --live-counters-file /Users/jiuwen/LLMBenchmark/results/mac_benchmark/monitor/<model_tag>/workload_counters.jsonl \
+  --workload-window-s 15 \
+  --theoretical-tflops <理论峰值，可为空> --official-bandwidth-gb-s <官方带宽，可为空> \
+  --prefill-flops-per-token <值> --decode-flops-per-token <值> \
+  --prefill-bytes-per-token <值> --decode-bytes-per-token <值> \
+  --out results/mac_benchmark/accuracy/<model_tag>
 ```
 
 ---
@@ -574,7 +598,7 @@ vm_stat
 sysctl vm.swapusage
 memory_pressure
 iostat -w 1 -d disk0
-sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；无权限标"未采集"
+sudo powermetrics --samplers cpu_power,gpu_power,ane_power,thermal -i 1000   # 需 sudo；无权限标"未采集"
 ```
 
 ### 7.3 结论模板
@@ -643,7 +667,7 @@ sudo powermetrics --samplers cpu_power,gpu_power,thermal -i 1000   # 需 sudo；
 
 所有 `null` 正式运行后替换为实测值；缺失字段不补 0、不估算。MLX-VLM 的行用 `engine: "mlx-vlm"`、`draft_model: null`、`kv_format: null`。
 
-并发多 Query 能力评测结果（`tools/bench_multi_query.py` 的 `stage_<c>_requests.jsonl`）新增以下端侧评测字段：
+并发多 Query 能力评测结果（`tools/bench_accuracy_concurrency.py` 的 `stage_<c>_requests.jsonl`）新增以下端侧评测字段：
 
 ```text
 sample_id / eval_name / model_name / prompt / response
@@ -666,7 +690,7 @@ per_request_machine.memory_used_gib / memory_free_gib / wired_gib / swap_used_mi
 
 ### 8.2 分引擎汇总表（v5 强制）
 
-每个并发档位（1/2/4/8/16）复制一份本表，命名为表 A-c1、表 A-c2 …… 表 A-c16；**不同档位数据分表，不混算**。CPU/GPU/NPU、算力、带宽等机器指标随档位由 `monitor_machine.py` 输出时间序列图（见 8.3 图 6～9），不在本表重复列。
+每个并发档位（1/2/4/8/16）复制一份本表，命名为表 A-c1、表 A-c2 …… 表 A-c16；**不同档位数据分表，不混算**。CPU/GPU/NPU 等硬件状态与有效算力/有效带宽随档位由 `monitor_machine.py` 输出时间序列图（见 8.3 图 6～9），不在本表重复列。
 
 **表 A — Splash 1.5.0 / Qwen3.8-27B（GGUF Q4_K_M + DFlash2 + INT8 KV，单档模板）：**
 
@@ -693,7 +717,7 @@ per_request_machine.memory_used_gib / memory_free_gib / wired_gib / swap_used_mi
 - 图 6：CPU 使用率随时间与并发档位变化（占用/总核）；
 - 图 7：GPU/NPU duty/功率随时间与并发档位变化；
 - 图 8：内存 used/free/cache/available 与 swap 随时间变化；
-- 图 9：吞吐与算力（TFLOPS/PFLOPS）随并发档位变化，标注量化单位。
+- 图 9：吞吐、有效算力（TFLOPS）与有效带宽（GB/s）随并发档位变化，标注量化单位。
 
 图表保存到：`/Users/augustus/Desktop/LLMBenchmark/results/mac_benchmark/charts/`
 
@@ -774,7 +798,7 @@ Gemma-4-26B-A4B-MLXVLM-4bit-MMLU-Jiuwen35
 - [ ] 按引擎分表（A/B/C）；
 - [ ] 同引擎内比较模型；跨引擎只做观察；
 - [ ] 报告冷加载、TTFT、Prefill、Decode、内存、能力集稳定性、SSD 读取；
-- [ ] 输出每个并发档位的 CPU/GPU/NPU、内存、算力、带宽原始采样与图表；
+- [ ] 输出每个并发档位的 CPU/GPU/NPU、内存硬件状态原始采样，以及有效算力/有效带宽的时间序列与图表；
 - [ ] 保存原始日志、命令、模型 revision 和测试日期；
 - [ ] 异常样本单独说明，不删除失败记录。
 
@@ -834,4 +858,4 @@ Gemma 配置为 `Gemma4ForConditionalGeneration` / `gemma4`（text：`gemma4_tex
 
 - **v3（2026-11-23）及更早**：Ollama 统一基线 + MLX-LM 性能专项 + 三机（3.5/3.13/3.7）对比口径，原文见 git 历史（commit `0e76b3d`）；其中 Ollama 部署细节、Gemma Ollama 选型、3.7 oMLX 缓存分析等内容随引擎口径切换不再维护。
 - **v4（2026-11-24）**：切换为 Splash 1.5.0 + MLX-VLM 0.8.0 双引擎、3.5 单机独占、分表对比口径。部署细节的完整实机核查证据见 [Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md](./Jiuwen3.5_Splash与Gemma_MLX评测部署方案.md)。
-- **v5（2026-11-24，本版）**：评测集切换为仓库原生能力评测集，正式口径改为并发阶梯（1→2→4→8→16），新增机器指标（CPU/GPU/NPU、内存、算力、带宽）全程实时监控；8.2 汇总表按并发档位分表。
+- **v5（2026-11-24，本版）**：评测集切换为仓库原生能力评测集，正式口径改为并发阶梯（1→2→4→8→16），新增机器指标（CPU/GPU/NPU、内存硬件状态 + workload 有效算力/有效带宽）全程实时监控；8.2 汇总表按并发档位分表。

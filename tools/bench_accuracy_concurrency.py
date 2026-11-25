@@ -39,11 +39,13 @@ try:
         ENGINE_PRESETS, build_base_url, resolve_target_config, DS_ORDER, SOURCE_MODEL)
     from tools.bench_common import (
         BenchRequestError, OpenAICompatClient, SystemMonitor, detect_hardware, summarize_repeats)
+    from tools.monitor_machine import derive_phase_effective_rates
 except ImportError:  # python tools/bench_accuracy_concurrency.py 直跑
     from collect_local_882 import (  # type: ignore
         ENGINE_PRESETS, build_base_url, resolve_target_config, DS_ORDER, SOURCE_MODEL)
     from bench_common import (  # type: ignore
         BenchRequestError, OpenAICompatClient, SystemMonitor, detect_hardware, summarize_repeats)
+    from monitor_machine import derive_phase_effective_rates  # type: ignore
 
 DEFAULT_CONCURRENCY = "1,2,4"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -215,12 +217,55 @@ def make_request_record(query: Dict[str, Any], raw: Dict[str, Any],
         "completion_tokens": raw.get("completion_tokens"),
         "prefill_tok_per_s": raw.get("prefill_tok_per_s"),
         "decode_tok_per_s": raw.get("decode_tok_per_s"),
+        "prefill_s": raw.get("prefill_s"),
+        "decode_s": raw.get("decode_s"),
+        "server_wall_s": raw.get("server_wall_s"),
+        "request_start_time": raw.get("request_start_time"),
+        "first_token_time": raw.get("first_token_time"),
+        "response_end_time": raw.get("response_end_time"),
+        "timing_source": raw.get("timing_source"),
         "e2e_s": raw.get("e2e_s"),
         "ttft_s": raw.get("ttft_s"),
         "mode": mode,
         "attempt_index": attempt_index,
         "retry_count": retry_count,
     }
+
+
+def make_workload_event(record: Dict[str, Any], concurrency: int,
+                        wall_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """把已完成且成功的请求转成监控侧可增量读取的 workload 事件。
+
+    失败请求不进入 token 吞吐，避免把 0 token 的错误放大成“低吞吐”；
+    统计仍由 stage summary 的 success/error 字段负责。
+    """
+    if not record.get("success"):
+        return None
+    if record.get("prompt_tokens") is None and record.get("completion_tokens") is None:
+        return None
+    return {
+        "wall_time": time.time() if wall_time is None else wall_time,
+        "concurrency": concurrency,
+        "dataset_id": record.get("dataset_id"),
+        "record_index": record.get("record_index"),
+        "mode": record.get("mode"),
+        "prompt_tokens": record.get("prompt_tokens"),
+        "completion_tokens": record.get("completion_tokens"),
+        "ttft_s": record.get("ttft_s"),
+        "prefill_s": record.get("prefill_s"),
+        "decode_s": record.get("decode_s"),
+        "e2e_s": record.get("e2e_s"),
+    }
+
+
+def append_workload_event(path: Optional[str], event: Optional[Dict[str, Any]]) -> None:
+    """向 monitor_machine 跟随的 JSONL 追加一个事件并立即 flush。"""
+    if not path or event is None:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        f.flush()
 
 
 def per_dataset_accuracy(requests: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -244,9 +289,22 @@ def _stats_mean(values: List[Optional[float]]) -> Optional[float]:
     return s["mean"]
 
 
-def compute_stage_summary(requests: List[Dict[str, Any]], wall_s: float,
-                          concurrency: int) -> Dict[str, Any]:
-    """并发档位汇总：准确率 + 吞吐 + 延迟统计 + 每数据集正确率。"""
+def compute_stage_summary(
+        requests: List[Dict[str, Any]], wall_s: float, concurrency: int,
+        theoretical_tflops: Optional[float] = None,
+        official_bandwidth_gb_s: Optional[float] = None,
+        prefill_flops_per_token: Optional[float] = None,
+        decode_flops_per_token: Optional[float] = None,
+        prefill_bytes_per_token: Optional[float] = None,
+        decode_bytes_per_token: Optional[float] = None,
+        flops_per_token: Optional[float] = None,
+        bytes_per_token: Optional[float] = None) -> Dict[str, Any]:
+    """并发档位汇总：准确率 + 吞吐 + 延迟统计 + 有效算力/带宽。
+
+    Prefill 使用 input_tokens_per_s，Decode 使用 output_tokens_per_s。
+    ``flops_per_token`` / ``bytes_per_token`` 是兼容旧命令的通用回退值；
+    正式 MoE 评测应显式给分阶段激活参数口径。
+    """
     ok = [r for r in requests if r.get("success")]
     scored = [r for r in ok if r.get("is_correct") is not None]
     correct = [r for r in scored if r["is_correct"]]
@@ -255,7 +313,28 @@ def compute_stage_summary(requests: List[Dict[str, Any]], wall_s: float,
     ttft = [r.get("ttft_s") for r in ok if r.get("ttft_s") is not None]
     pt = [r.get("prompt_tokens") for r in ok if r.get("prompt_tokens") is not None]
     ct = [r.get("completion_tokens") for r in ok if r.get("completion_tokens") is not None]
-    return {
+    total_prompt = sum(pt) if pt else None
+    total_completion = sum(ct) if ct else None
+    tokens_per_s = None
+    if wall_s > 0 and (total_prompt is not None or total_completion is not None):
+        tokens_per_s = round(((total_prompt or 0) + (total_completion or 0)) / wall_s, 2)
+    input_tokens_per_s = (round(total_prompt / wall_s, 2)
+                          if wall_s > 0 and total_prompt is not None else None)
+    output_tokens_per_s = (round(total_completion / wall_s, 2)
+                           if wall_s > 0 and total_completion is not None else None)
+    prefill_flops = (prefill_flops_per_token if prefill_flops_per_token is not None
+                     else flops_per_token)
+    decode_flops = (decode_flops_per_token if decode_flops_per_token is not None
+                    else flops_per_token)
+    prefill_bytes = (prefill_bytes_per_token if prefill_bytes_per_token is not None
+                     else bytes_per_token)
+    decode_bytes = (decode_bytes_per_token if decode_bytes_per_token is not None
+                    else bytes_per_token)
+    compute = derive_phase_effective_rates(
+        theoretical_tflops, official_bandwidth_gb_s,
+        input_tokens_per_s, output_tokens_per_s,
+        prefill_flops, decode_flops, prefill_bytes, decode_bytes)
+    summary = {
         "concurrency": concurrency,
         "wall_s": round(wall_s, 3),
         "total_requests": len(requests),
@@ -267,16 +346,29 @@ def compute_stage_summary(requests: List[Dict[str, Any]], wall_s: float,
         "n_correct": len(correct),
         "accuracy": (len(correct) / len(scored)) if scored else None,
         "requests_per_s": round(len(ok) / wall_s, 3) if wall_s > 0 else None,
-        "total_prompt_tokens": sum(pt) if pt else None,
-        "total_completion_tokens": sum(ct) if ct else None,
-        "tokens_per_s": round((sum(pt) + sum(ct)) / wall_s, 2)
-                        if wall_s > 0 and (pt or ct) else None,
+        "total_prompt_tokens": total_prompt,
+        "total_completion_tokens": total_completion,
+        "tokens_per_s": tokens_per_s,
+        "input_tokens_per_s": input_tokens_per_s,
+        "output_tokens_per_s": output_tokens_per_s,
         "decode_tok_per_s_mean": round(_stats_mean(decode), 2) if decode else None,
         "prefill_tok_per_s_mean": round(_stats_mean(prefill), 2) if prefill else None,
         "ttft_s_mean": round(_stats_mean(ttft), 4) if ttft else None,
         "ttft_s_p95": round(summarize_repeats(ttft)["p95"], 4) if ttft else None,
         "per_dataset_accuracy": per_dataset_accuracy(requests),
     }
+    summary.update(compute)
+    summary["compute"] = {
+        **compute,
+        "measurement": "derived_from_stage_token_throughput",
+        "theoretical_tflops": theoretical_tflops,
+        "official_bandwidth_gb_s": official_bandwidth_gb_s,
+        "prefill_flops_per_token": prefill_flops,
+        "decode_flops_per_token": decode_flops,
+        "prefill_bytes_per_token": prefill_bytes,
+        "decode_bytes_per_token": decode_bytes,
+    }
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +439,8 @@ def run_one(client: OpenAICompatClient, query: Dict[str, Any], evaluator: Any,
 
 
 def run_stage(concurrency: int, queries: List[Dict[str, Any]], client: OpenAICompatClient,
-              evaluators: Dict[str, Any], args: argparse.Namespace
+              evaluators: Dict[str, Any], args: argparse.Namespace,
+              workload_counters_path: Optional[str] = None
               ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """一个并发档位：warmup + 对全部 query 并发请求判分。"""
     modes: List[str] = []
@@ -375,15 +468,27 @@ def run_stage(concurrency: int, queries: List[Dict[str, Any]], client: OpenAICom
                 for q, m in tasks]
         for fut in as_completed(futs):
             try:
-                requests.append(fut.result())
+                record = fut.result()
             except Exception as exc:  # 防御性兜底
-                requests.append({"dataset_id": None, "record_index": None, "success": False,
-                                 "is_correct": None, "fail_reason": f"future_error: {exc}",
-                                 "mode": None, "ttft_s": None, "decode_tok_per_s": None,
-                                 "prefill_tok_per_s": None, "e2e_s": None})
+                record = {"dataset_id": None, "record_index": None, "success": False,
+                          "is_correct": None, "fail_reason": f"future_error: {exc}",
+                          "mode": None, "ttft_s": None, "decode_tok_per_s": None,
+                          "prefill_tok_per_s": None, "e2e_s": None}
+            requests.append(record)
+            append_workload_event(workload_counters_path,
+                                  make_workload_event(record, concurrency))
     wall_s = time.perf_counter() - started
     memory, ssd_read = monitor.stop()
-    summary = compute_stage_summary(requests, wall_s, concurrency)
+    summary = compute_stage_summary(
+        requests, wall_s, concurrency,
+        theoretical_tflops=getattr(args, "theoretical_tflops", None),
+        official_bandwidth_gb_s=getattr(args, "official_bandwidth_gb_s", None),
+        prefill_flops_per_token=getattr(args, "prefill_flops_per_token", None),
+        decode_flops_per_token=getattr(args, "decode_flops_per_token", None),
+        prefill_bytes_per_token=getattr(args, "prefill_bytes_per_token", None),
+        decode_bytes_per_token=getattr(args, "decode_bytes_per_token", None),
+        flops_per_token=getattr(args, "flops_per_token", None),
+        bytes_per_token=getattr(args, "bytes_per_token", None))
     summary["memory"] = memory
     summary["ssd_read_mib_s"] = ssd_read
     return summary, requests
@@ -426,6 +531,29 @@ def render_markdown(stages: List[Dict[str, Any]], query_count: int) -> str:
             f"| {s['concurrency']} | {acc} | {s['n_scored']} | {s['success_requests']} "
             f"| {s.get('success_rate') or '-'} | {s.get('requests_per_s') or '-'} "
             f"| {s.get('decode_tok_per_s_mean') or '-'} | {ttft} | {s['error_requests']} |")
+    lines += [
+        "",
+        "## 有效算力与有效带宽（workload-level 推导值）",
+        "",
+        "> 这些值由完成请求的 token 吞吐和显式指定的每 token FLOPs/字节数推导，"
+        "不是 Apple GPU/ANE 物理计数器实测值；缺少参数时保持空值。"
+        "Prefill 使用输入 token 吞吐，Decode 使用输出 token 吞吐。",
+        "",
+        "| 并发 | input tok/s | output tok/s | Prefill TFLOPS | Decode TFLOPS | "
+        "总有效带宽 GB/s | TFLOPS 利用率 | 带宽利用率 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for s in stages:
+        def fmt(v, nd=3):
+            return f"{v:.{nd}f}" if isinstance(v, (int, float)) else "-"
+        lines.append(
+            f"| {s['concurrency']} | {fmt(s.get('input_tokens_per_s'), 2)} "
+            f"| {fmt(s.get('output_tokens_per_s'), 2)} "
+            f"| {fmt(s.get('prefill_effective_tflops'))} "
+            f"| {fmt(s.get('decode_effective_tflops'))} "
+            f"| {fmt(s.get('effective_bandwidth_gb_s'))} "
+            f"| {fmt(s.get('tflops_utilization'), 4)} "
+            f"| {fmt(s.get('bandwidth_utilization'), 4)} |")
     return "\n".join(lines) + "\n"
 
 
@@ -487,6 +615,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="每数据集最多采几题（0=全部 882 对齐题），用于冒烟")
     p.add_argument("--server-pid", type=int, default=None)
     p.add_argument("--monitor-disk", default=None)
+    p.add_argument("--live-counters-file", default=None,
+                   help="每个请求完成时追加 workload JSONL，供 monitor_machine 实时跟随")
+    p.add_argument("--workload-window-s", type=float, default=15.0,
+                   help="监控侧实时 token/s 滑动窗口秒数（写入 manifest）")
+    p.add_argument("--theoretical-tflops", type=float, default=None,
+                   help="硬件理论峰值算力 TFLOPS，仅作利用率分母")
+    p.add_argument("--official-bandwidth-gb-s", type=float, default=None,
+                   help="硬件理论统一内存带宽 GB/s，仅作利用率分母")
+    p.add_argument("--flops-per-token", type=float, default=None,
+                   help="通用每 token FLOPs；分阶段参数缺省时回退使用")
+    p.add_argument("--bytes-per-token", type=float, default=None,
+                   help="通用每 token 字节数；分阶段参数缺省时回退使用")
+    p.add_argument("--prefill-flops-per-token", type=float, default=None)
+    p.add_argument("--decode-flops-per-token", type=float, default=None)
+    p.add_argument("--prefill-bytes-per-token", type=float, default=None)
+    p.add_argument("--decode-bytes-per-token", type=float, default=None)
     p.add_argument("--out", default=None)
     p.add_argument("--dry-run", action="store_true", help="只加载 882 题并打印统计，不请求服务")
     return p
@@ -576,13 +720,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     stages: List[Dict[str, Any]] = []
     abort_info: Optional[Dict[str, Any]] = None
+    live_counters_file = args.live_counters_file
+    if live_counters_file:
+        live_counters_file = (live_counters_file if os.path.isabs(live_counters_file)
+                              else os.path.join(out_dir, live_counters_file))
+        os.makedirs(os.path.dirname(live_counters_file) or ".", exist_ok=True)
+        if os.path.exists(live_counters_file):
+            os.remove(live_counters_file)
+        print(f"[monitor] live counters -> {live_counters_file}", flush=True)
     n_levels = len(args.concurrency)
     for level_idx, concurrency in enumerate(args.concurrency):
         stage_queries = queries
         if args.shard_across_levels:
             stage_queries = shard_queries(queries, n_levels, level_idx)
         print(f"[stage] concurrency={concurrency} queries={len(stage_queries)}", flush=True)
-        summary, requests = run_stage(concurrency, stage_queries, client, evaluators, args)
+        summary, requests = run_stage(concurrency, stage_queries, client, evaluators, args,
+                                      workload_counters_path=live_counters_file)
         stages.append(summary)
         write_json(os.path.join(out_dir, f"stage_{concurrency}.json"), summary)
         write_jsonl(os.path.join(out_dir, f"stage_{concurrency}_requests.jsonl"), requests)
@@ -630,6 +783,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         "temperature": args.temperature,
         "seed": args.seed,
         "cold_load_s": args.cold_load_s,
+        "live_counters_file": live_counters_file,
+        "workload_window_s": args.workload_window_s,
+        "theoretical_tflops": args.theoretical_tflops,
+        "official_bandwidth_gb_s": args.official_bandwidth_gb_s,
+        "flops_per_token": args.flops_per_token,
+        "bytes_per_token": args.bytes_per_token,
+        "prefill_flops_per_token": args.prefill_flops_per_token,
+        "decode_flops_per_token": args.decode_flops_per_token,
+        "prefill_bytes_per_token": args.prefill_bytes_per_token,
+        "decode_bytes_per_token": args.decode_bytes_per_token,
         "query_count": len(queries),
         "hardware": detect_hardware(),
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
