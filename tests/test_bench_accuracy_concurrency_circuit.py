@@ -77,3 +77,36 @@ class TestParserDefaults(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShardQueries(unittest.TestCase):
+    def test_round_robin(self):
+        from tools.bench_accuracy_concurrency import shard_queries
+        qs = list(range(8))
+        self.assertEqual(shard_queries(qs, 4, 0), [0, 4])
+        self.assertEqual(shard_queries(qs, 4, 1), [1, 5])
+        self.assertEqual(shard_queries(qs, 4, 2), [2, 6])
+        self.assertEqual(shard_queries(qs, 4, 3), [3, 7])
+
+    def test_single_shard(self):
+        from tools.bench_accuracy_concurrency import shard_queries
+        self.assertEqual(shard_queries([10, 20, 30], 1, 0), [10, 20, 30])
+
+    def test_index_out_of_range_empty(self):
+        from tools.bench_accuracy_concurrency import shard_queries
+        self.assertEqual(shard_queries([1, 2, 3], 2, 99), [])
+
+
+class TestShardParserFlag(unittest.TestCase):
+    def test_flag_off_by_default(self):
+        args = build_parser().parse_args(["--engine", "splash-qwen38"])
+        self.assertFalse(args.shard_across_levels)
+
+    def test_flag_on(self):
+        args = build_parser().parse_args(
+            ["--engine", "splash-qwen38", "--shard-across-levels"])
+        self.assertTrue(args.shard_across_levels)
+
+
+if __name__ == "__main__":
+    unittest.main()

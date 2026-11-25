@@ -109,6 +109,17 @@ def build_queries_from_items(dataset_id: str, items: Iterable[Dict[str, Any]],
     return queries
 
 
+def shard_queries(queries: List[Dict[str, Any]], n_shards: int,
+                 shard_index: int) -> List[Dict[str, Any]]:
+    """round-robin 切片：把 query 列表按下标取模分成 n 份，取第 shard_index 份。
+
+    用于 --shard-across-levels：五档各跑约 1/5 的题，合计覆盖全部 882 题。
+    """
+    if n_shards <= 0:
+        return []
+    return queries[shard_index::n_shards]
+
+
 def load_manifest(path: str) -> List[Dict[str, Any]]:
     """读取抽样清单 JSONL（每行 {"dataset_id", "record_index"}）。"""
     if not path or not os.path.exists(path):
@@ -446,6 +457,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "882=对齐 DeepSeek 882 题（需 results/bench）")
     p.add_argument("--manifest", default=None,
                    help="抽样清单 JSONL（query-source=manifest 时必填）")
+    p.add_argument("--shard-across-levels", action="store_true",
+                   help="把 query 按并发档数 round-robin 切片，每档只跑自己的那份，"
+                        "合计覆盖全部题目（省时）")
     p.add_argument("--service-max-concurrency", type=int, default=None,
                    help="服务端 queue-size/max-num-seqs 上限；超过的并发档跳过")
     p.add_argument("--max-rss-gib", type=float, default=55.0,
@@ -560,9 +574,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     stages: List[Dict[str, Any]] = []
     abort_info: Optional[Dict[str, Any]] = None
-    for concurrency in args.concurrency:
-        print(f"[stage] concurrency={concurrency}", flush=True)
-        summary, requests = run_stage(concurrency, queries, client, evaluators, args)
+    n_levels = len(args.concurrency)
+    for level_idx, concurrency in enumerate(args.concurrency):
+        stage_queries = queries
+        if args.shard_across_levels:
+            stage_queries = shard_queries(queries, n_levels, level_idx)
+        print(f"[stage] concurrency={concurrency} queries={len(stage_queries)}", flush=True)
+        summary, requests = run_stage(concurrency, stage_queries, client, evaluators, args)
         stages.append(summary)
         write_json(os.path.join(out_dir, f"stage_{concurrency}.json"), summary)
         write_jsonl(os.path.join(out_dir, f"stage_{concurrency}_requests.jsonl"), requests)
