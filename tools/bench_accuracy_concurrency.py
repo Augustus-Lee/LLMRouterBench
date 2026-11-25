@@ -480,6 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--timeout", type=float, default=1800.0)
+    p.add_argument("--cold-load-s", type=float, default=None,
+                   help="冷加载秒数（服务进程启动 -> /ready，启动方测量后传入）")
     p.add_argument("--datasets", default="", help="逗号分隔 dataset_id，默认全部 6 类（882 对齐子集）")
     p.add_argument("--limit-per-dataset", type=int, default=0,
                    help="每数据集最多采几题（0=全部 882 对齐题），用于冒烟")
@@ -627,6 +629,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "max_output_tokens": args.max_output_tokens,
         "temperature": args.temperature,
         "seed": args.seed,
+        "cold_load_s": args.cold_load_s,
         "query_count": len(queries),
         "hardware": detect_hardware(),
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
