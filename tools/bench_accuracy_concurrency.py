@@ -205,6 +205,7 @@ def compute_stage_summary(requests: List[Dict[str, Any]], wall_s: float,
         "success_requests": len(ok),
         "error_requests": len(requests) - len(ok),
         "success_rate": round(len(ok) / len(requests), 4) if requests else None,
+        "error_rate": round((len(requests) - len(ok)) / len(requests), 4) if requests else None,
         "n_scored": len(scored),
         "n_correct": len(correct),
         "accuracy": (len(correct) / len(scored)) if scored else None,
@@ -224,6 +225,27 @@ def compute_stage_summary(requests: List[Dict[str, Any]], wall_s: float,
 # ---------------------------------------------------------------------------
 # 单题请求 + 判分
 # ---------------------------------------------------------------------------
+
+def should_abort(summary: Dict[str, Any], max_rss_gib: Optional[float],
+                 max_swap_gib: Optional[float],
+                 max_error_rate: Optional[float]) -> List[str]:
+    """判断某并发档是否应熔断；返回触发原因列表（空=继续升档）。
+
+    任一指标为 None（未采集/未设置阈值）都不触发；阈值设为 None 表示关闭该熔断项。
+    """
+    reasons: List[str] = []
+    mem = summary.get("memory") or {}
+    rss = mem.get("peak_process_gib")
+    swap = mem.get("swap_delta_gib")
+    err = summary.get("error_rate")
+    if max_rss_gib is not None and rss is not None and rss > max_rss_gib:
+        reasons.append(f"rss_peak {rss:.2f}GiB > {max_rss_gib}GiB")
+    if max_swap_gib is not None and swap is not None and swap > max_swap_gib:
+        reasons.append(f"swap_delta {swap:.3f}GiB > {max_swap_gib}GiB")
+    if max_error_rate is not None and err is not None and err > max_error_rate:
+        reasons.append(f"error_rate {err:.2%} > {max_error_rate:.2%}")
+    return reasons
+
 
 def _score(evaluator: Any, query: Dict[str, Any], output_text: Optional[str]):
     """调用原生 evaluator 判分；返回 (is_correct, prediction)。"""
@@ -378,6 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "882=对齐 DeepSeek 882 题（需 results/bench）")
     p.add_argument("--service-max-concurrency", type=int, default=None,
                    help="服务端 queue-size/max-num-seqs 上限；超过的并发档跳过")
+    p.add_argument("--max-rss-gib", type=float, default=55.0,
+                   help="服务进程峰值 RSS 熔断阈值（GiB），默认 55")
+    p.add_argument("--max-swap-gib", type=float, default=4.0,
+                   help="swap 增量熔断阈值（GiB），默认 4")
+    p.add_argument("--max-error-rate", type=float, default=0.3,
+                   help="错误率熔断阈值（0~1），默认 0.3")
     p.add_argument("--concurrency", type=parse_concurrency, default=parse_concurrency(DEFAULT_CONCURRENCY),
                    help="并发阶梯，默认 1,2,4")
     p.add_argument("--repeat", type=int, default=1, help="每个 query 每 mode 重复次数")
@@ -464,6 +492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     client = _make_client(target["base_url"], target["api_model"], args.timeout)
 
     stages: List[Dict[str, Any]] = []
+    abort_info: Optional[Dict[str, Any]] = None
     for concurrency in args.concurrency:
         print(f"[stage] concurrency={concurrency}", flush=True)
         summary, requests = run_stage(concurrency, queries, client, evaluators, args)
@@ -475,6 +504,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  acc={acc_s} scored={summary['n_scored']} "
               f"err={summary['error_requests']} "
               f"decode_mean={summary.get('decode_tok_per_s_mean')}", flush=True)
+        reasons = should_abort(summary, args.max_rss_gib, args.max_swap_gib,
+                               args.max_error_rate)
+        if reasons:
+            prev = stages[-2]["concurrency"] if len(stages) >= 2 else None
+            abort_info = {"aborted_at_concurrency": concurrency,
+                          "abort_reasons": reasons,
+                          "stable_max_concurrency": prev}
+            print(f"[abort] concurrency={concurrency} 触发熔断：{reasons}；"
+                  f"稳定最大并发={prev}", flush=True)
+            break
 
     manifest = {
         "target_model": target["target_model"],
@@ -490,6 +529,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "query_source": args.query_source,
         "aligned_to_882": args.query_source == "882",
         "service_max_concurrency": args.service_max_concurrency,
+        "max_rss_gib": args.max_rss_gib,
+        "max_swap_gib": args.max_swap_gib,
+        "max_error_rate": args.max_error_rate,
+        "aborted_at_concurrency": abort_info["aborted_at_concurrency"] if abort_info else None,
+        "abort_reasons": abort_info["abort_reasons"] if abort_info else [],
+        "stable_max_concurrency": (abort_info["stable_max_concurrency"] if abort_info
+                                   else (args.concurrency[-1] if args.concurrency else None)),
         "concurrency": args.concurrency,
         "repeat": args.repeat,
         "mode": args.mode,
