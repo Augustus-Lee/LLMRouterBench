@@ -369,7 +369,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     started = time.monotonic()
     idx = 0
     print(f"[monitor] start duration={args.duration}s interval={args.interval}s "
-          f"out={args.out}")
+          f"out={args.out}", flush=True)
+    metrics_path = os.path.join(args.out, "metrics.jsonl")
+    metrics_f = open(metrics_path, "w", encoding="utf-8")
     try:
         while time.monotonic() - started < args.duration:
             t = time.monotonic() - started
@@ -383,17 +385,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 sample["gpu"] = None
             rows.append(sample)
+            metrics_f.write(json.dumps(sample, ensure_ascii=False, sort_keys=True) + "\n")
+            metrics_f.flush()
             if idx % 10 == 0:
                 cpu = sample.get("cpu") or {}
                 mem = sample.get("memory") or {}
                 print(f"[monitor] t={t:6.1f}s cpu_used={cpu.get('used_percent')}% "
-                      f"mem_used={mem.get('used_gib_approx')} GiB")
+                      f"mem_used={mem.get('used_gib_approx')} GiB", flush=True)
             idx += 1
             time.sleep(max(0.0, min(args.interval, args.duration - (time.monotonic() - started))))
     except KeyboardInterrupt:
-        print("[monitor] interrupted by user")
+        print("[monitor] interrupted by user", flush=True)
 
-    write_jsonl(os.path.join(args.out, "metrics.jsonl"), rows)
+    metrics_f.close()
     charts = make_charts(rows, args.out) if args.chart else []
     print(f"[monitor] done samples={len(rows)} -> {args.out}")
     if charts:
