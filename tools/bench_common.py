@@ -354,6 +354,38 @@ def _extract_server_wall_s(data: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _extract_server_ttft(data: Dict[str, Any]) -> Optional[float]:
+    """从响应提取服务端 TTFT（秒）。
+
+    兼容多种格式（优先级从高到低）：
+      - Splash: metrics.request_latency.ttft_ms
+      - Splash fallback: metrics.request_latency.start_to_first_token_ms
+      - 顶层 request_latency.ttft_ms
+      - timings.ttft_ms
+    """
+    rl = (data.get("metrics") or {}).get("request_latency")
+    if isinstance(rl, dict):
+        for key in ("ttft_ms", "start_to_first_token_ms"):
+            if rl.get(key) is not None:
+                try:
+                    return float(rl[key]) / 1000.0
+                except (TypeError, ValueError):
+                    return None
+    rl_top = data.get("request_latency")
+    if isinstance(rl_top, dict) and rl_top.get("ttft_ms") is not None:
+        try:
+            return float(rl_top["ttft_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            return None
+    timings = data.get("timings")
+    if isinstance(timings, dict) and timings.get("ttft_ms") is not None:
+        try:
+            return float(timings["ttft_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _first_int(*values: Any) -> Optional[int]:
     for value in values:
         if value is None:
@@ -503,7 +535,7 @@ class OpenAICompatClient:
             "request_start_time": request_start_time,
             "first_token_time": None,
             "response_end_time": response_end_time,
-            "ttft_s": None,  # 非流式无法测 TTFT
+            "ttft_s": _extract_server_ttft(data),
             "prefill_s": prefill_s,
             "decode_s": decode_s,
             "prefill_tok_per_s": prefill_tps,

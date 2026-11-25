@@ -179,3 +179,29 @@ class TestExtractServerTimings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtractServerTtft(unittest.TestCase):
+    def test_splash_metrics_nested(self):
+        from tools.bench_common import _extract_server_ttft
+        data = {"metrics": {"request_latency": {"ttft_ms": 129.56}}}
+        self.assertAlmostEqual(_extract_server_ttft(data), 0.12956)
+
+    def test_fallback_start_to_first_token(self):
+        from tools.bench_common import _extract_server_ttft
+        data = {"metrics": {"request_latency": {"start_to_first_token_ms": 114.9}}}
+        self.assertAlmostEqual(_extract_server_ttft(data), 0.1149)
+
+    def test_top_level_request_latency(self):
+        from tools.bench_common import _extract_server_ttft
+        data = {"request_latency": {"ttft_ms": 200.0}}
+        self.assertAlmostEqual(_extract_server_ttft(data), 0.2)
+
+    def test_timings_ttft(self):
+        from tools.bench_common import _extract_server_ttft
+        data = {"timings": {"ttft_ms": 50.0}}
+        self.assertAlmostEqual(_extract_server_ttft(data), 0.05)
+
+    def test_missing_returns_none(self):
+        from tools.bench_common import _extract_server_ttft
+        self.assertIsNone(_extract_server_ttft({}))
