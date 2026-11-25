@@ -109,6 +109,52 @@ def build_queries_from_items(dataset_id: str, items: Iterable[Dict[str, Any]],
     return queries
 
 
+def load_manifest(path: str) -> List[Dict[str, Any]]:
+    """读取抽样清单 JSONL（每行 {"dataset_id", "record_index"}）。"""
+    if not path or not os.path.exists(path):
+        raise SystemExit(f"manifest 文件不存在：{path}")
+    entries: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError as exc:
+                raise SystemExit(f"manifest 非法行：{line[:80]}") from exc
+            entries.append({"dataset_id": e.get("dataset_id"),
+                            "record_index": int(e.get("record_index"))})
+    return entries
+
+
+def build_queries_from_manifest(manifest: Iterable[Dict[str, Any]],
+                                items_by_dataset: Dict[str, List[Dict[str, Any]]]
+                                ) -> List[Dict[str, Any]]:
+    """按抽样清单构造 query：用 (dataset_id, record_index) 精确取题。
+
+    越界索引、未知数据集、空 prompt 跳过；输出按 (DS_ORDER, record_index) 排序。
+    """
+    queries: List[Dict[str, Any]] = []
+    for entry in manifest:
+        ds = entry.get("dataset_id")
+        idx = entry.get("record_index")
+        items = items_by_dataset.get(ds, [])
+        if idx is None or idx < 0 or idx >= len(items):
+            continue
+        item = items[idx]
+        prompt = item.get("prompt")
+        if not prompt:
+            continue
+        queries.append({"dataset_id": ds, "record_index": idx,
+                        "prompt": str(prompt),
+                        "ground_truth": item.get("answer"),
+                        "origin_query": item.get("origin_query", "")})
+    order = {d: i for i, d in enumerate(DS_ORDER)}
+    queries.sort(key=lambda q: (order.get(q["dataset_id"], len(order)), q["record_index"]))
+    return queries
+
+
 def clamp_concurrency(ladder: List[int], service_max: Optional[int]
                       ) -> Tuple[List[int], List[int]]:
     """按服务容量钳制并发阶梯，返回 (保留档位, 被跳过档位)。"""
@@ -395,9 +441,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kv-format", default=None)
     p.add_argument("--state-format", default=None)
     p.add_argument("--model-revision-or-digest", default=None)
-    p.add_argument("--query-source", choices=("data", "882"), default="data",
+    p.add_argument("--query-source", choices=("data", "882", "manifest"), default="data",
                    help="query 来源：data=原生能力集全量（无需 results/bench）；"
                         "882=对齐 DeepSeek 882 题（需 results/bench）")
+    p.add_argument("--manifest", default=None,
+                   help="抽样清单 JSONL（query-source=manifest 时必填）")
     p.add_argument("--service-max-concurrency", type=int, default=None,
                    help="服务端 queue-size/max-num-seqs 上限；超过的并发档跳过")
     p.add_argument("--max-rss-gib", type=float, default=55.0,
@@ -458,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise SystemExit(f"{ds}: 加载评测集失败（缺数据或依赖？）: {exc}") from exc
             queries.extend(build_queries_from_items(ds, items, args.limit_per_dataset))
         src_label = "data/ 原生能力集（非 882 对齐）"
-    else:
+    elif args.query_source == "882":
         # 882 对齐模式：以 DeepSeek 历史矩阵的 prompt/index 为准，进路由矩阵
         from baselines.data_loader import BaselineDataLoader
         loader = BaselineDataLoader(config_path=os.path.join(ROOT, "config",
@@ -472,6 +520,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         for ds in {q["dataset_id"] for q in queries}:
             evaluators[ds] = evaluator_factory.get_evaluator(ds)
         src_label = f"{SOURCE_MODEL} 882 题对齐"
+    else:
+        # manifest 模式：按用户抽样清单取题（所有模型共用同一份清单）
+        if not args.manifest:
+            raise SystemExit("--query-source manifest 必须同时提供 --manifest 路径")
+        manifest = load_manifest(args.manifest)
+        if not manifest:
+            raise SystemExit(f"manifest 为空：{args.manifest}")
+        needed = [d for d in DS_ORDER
+                  if d in {e.get("dataset_id") for e in manifest}]
+        items_by_dataset: Dict[str, List[Dict[str, Any]]] = {}
+        for ds in needed:
+            try:
+                evaluator = evaluator_factory.get_evaluator(ds)
+                evaluators[ds] = evaluator
+                items_by_dataset[ds] = list(evaluator.load_data("test"))
+            except Exception as exc:
+                raise SystemExit(f"{ds}: 加载评测集失败: {exc}") from exc
+        queries = build_queries_from_manifest(manifest, items_by_dataset)
+        src_label = f"manifest 抽样清单（{len(manifest)} 条，{len(queries)} 有效）"
 
     if not queries:
         raise SystemExit("所选数据集没有可用 query")
