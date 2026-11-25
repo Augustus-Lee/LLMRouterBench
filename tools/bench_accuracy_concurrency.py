@@ -46,6 +46,7 @@ except ImportError:  # python tools/bench_accuracy_concurrency.py 直跑
         BenchRequestError, OpenAICompatClient, SystemMonitor, detect_hardware, summarize_repeats)
 
 DEFAULT_CONCURRENCY = "1,2,4"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,40 @@ def build_queries(records: Iterable[Any], only: Optional[set] = None,
 
 def parse_concurrency(raw: str) -> List[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
+
+
+def build_queries_from_items(dataset_id: str, items: Iterable[Dict[str, Any]],
+                             limit_per_dataset: int = 0) -> List[Dict[str, Any]]:
+    """data/ 能力集模式：从原生 evaluator.load_data 返回的 item 构造 query。
+
+    item 必须含 `prompt` 与 `answer`；record_index 按加载顺序编号（非 882 对齐）。
+    """
+    queries: List[Dict[str, Any]] = []
+    n = 0
+    for item in items:
+        if limit_per_dataset > 0 and n >= limit_per_dataset:
+            break
+        if isinstance(item, dict) is False:
+            continue
+        prompt = item.get("prompt")
+        if not prompt:
+            continue
+        queries.append({"dataset_id": dataset_id, "record_index": n,
+                        "prompt": str(prompt),
+                        "ground_truth": item.get("answer"),
+                        "origin_query": item.get("origin_query", "")})
+        n += 1
+    return queries
+
+
+def clamp_concurrency(ladder: List[int], service_max: Optional[int]
+                      ) -> Tuple[List[int], List[int]]:
+    """按服务容量钳制并发阶梯，返回 (保留档位, 被跳过档位)。"""
+    if service_max is None:
+        return list(ladder), []
+    kept = [c for c in ladder if c <= service_max]
+    skipped = [c for c in ladder if c > service_max]
+    return kept, skipped
 
 
 def make_request_record(query: Dict[str, Any], raw: Dict[str, Any],
@@ -338,6 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kv-format", default=None)
     p.add_argument("--state-format", default=None)
     p.add_argument("--model-revision-or-digest", default=None)
+    p.add_argument("--query-source", choices=("data", "882"), default="data",
+                   help="query 来源：data=原生能力集全量（无需 results/bench）；"
+                        "882=对齐 DeepSeek 882 题（需 results/bench）")
+    p.add_argument("--service-max-concurrency", type=int, default=None,
+                   help="服务端 queue-size/max-num-seqs 上限；超过的并发档跳过")
     p.add_argument("--concurrency", type=parse_concurrency, default=parse_concurrency(DEFAULT_CONCURRENCY),
                    help="并发阶梯，默认 1,2,4")
     p.add_argument("--repeat", type=int, default=1, help="每个 query 每 mode 重复次数")
@@ -364,24 +404,50 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     target = resolve_target_config(args)
 
-    # 重依赖懒加载：882 来源 + 原生 evaluator
-    from baselines.data_loader import BaselineDataLoader
+    # 并发阶梯按服务容量钳制（Splash --queue-size / MLX-VLM --max-num-seqs）
+    ladder, skipped = clamp_concurrency(args.concurrency, args.service_max_concurrency)
+    if skipped:
+        print(f"[warn] 并发档位 {skipped} 超过服务容量 {args.service_max_concurrency}，"
+              f"已跳过；实际阶梯={ladder}")
+    args.concurrency = ladder
+
     from evaluation.factory import EvaluatorFactory
 
-    loader = BaselineDataLoader(
-        config_path=str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                    "config", "baseline_config_edge.yaml")))
-    records = [r for r in loader.load_all_records() if r.model_name == SOURCE_MODEL]
-    if not records:
-        raise SystemExit(
-            f"未找到 {SOURCE_MODEL} 的 882 题来源记录：请确认 results/bench/<ds>/test/"
-            f"{SOURCE_MODEL}/ 存在且 config/baseline_config_edge.yaml 指向正确")
-
+    evaluator_factory = EvaluatorFactory()
     only = {d.strip() for d in args.datasets.split(",") if d.strip()} or None
-    queries = build_queries(records, only=only, limit_per_dataset=args.limit_per_dataset)
+    ds_list = [d for d in DS_ORDER if (only is None or d in only)]
+
+    queries: List[Dict[str, Any]] = []
+    evaluators: Dict[str, Any] = {}
+    if args.query_source == "data":
+        # 原生能力集全量模式：无需 results/bench；用 evaluator.load_data 的 prompt + 原生判分
+        for ds in ds_list:
+            try:
+                evaluator = evaluator_factory.get_evaluator(ds)
+                evaluators[ds] = evaluator
+                items = evaluator.load_data("test")
+            except Exception as exc:
+                raise SystemExit(f"{ds}: 加载评测集失败（缺数据或依赖？）: {exc}") from exc
+            queries.extend(build_queries_from_items(ds, items, args.limit_per_dataset))
+        src_label = "data/ 原生能力集（非 882 对齐）"
+    else:
+        # 882 对齐模式：以 DeepSeek 历史矩阵的 prompt/index 为准，进路由矩阵
+        from baselines.data_loader import BaselineDataLoader
+        loader = BaselineDataLoader(config_path=os.path.join(ROOT, "config",
+                                                            "baseline_config_edge.yaml"))
+        records = [r for r in loader.load_all_records() if r.model_name == SOURCE_MODEL]
+        if not records:
+            raise SystemExit(
+                f"未找到 {SOURCE_MODEL} 的 882 题来源记录：请确认 results/bench/<ds>/test/"
+                f"{SOURCE_MODEL}/ 存在且 config/baseline_config_edge.yaml 指向正确")
+        queries = build_queries(records, only=only, limit_per_dataset=args.limit_per_dataset)
+        for ds in {q["dataset_id"] for q in queries}:
+            evaluators[ds] = evaluator_factory.get_evaluator(ds)
+        src_label = f"{SOURCE_MODEL} 882 题对齐"
+
     if not queries:
         raise SystemExit("所选数据集没有可用 query")
-    print(f"[load] {len(queries)} query / {SOURCE_MODEL} 对齐")
+    print(f"[load] {len(queries)} query / {src_label}")
     print(f"[target] {target['target_model']} @ {target['base_url']}")
     print(f"[ladder] concurrency={args.concurrency} mode={args.mode} "
           f"repeat={args.repeat}")
@@ -394,11 +460,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             per_ds[q["dataset_id"]] = per_ds.get(q["dataset_id"], 0) + 1
         print(f"[dry-run] per-dataset={per_ds} out={out_dir}")
         return 0
-
-    evaluator_factory = EvaluatorFactory()
-    evaluators: Dict[str, Any] = {}
-    for ds in {q["dataset_id"] for q in queries}:
-        evaluators[ds] = evaluator_factory.get_evaluator(ds)
 
     client = _make_client(target["base_url"], target["api_model"], args.timeout)
 
@@ -426,6 +487,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         "draft_model": args.draft_model,
         "kv_format": args.kv_format,
         "state_format": args.state_format,
+        "query_source": args.query_source,
+        "aligned_to_882": args.query_source == "882",
+        "service_max_concurrency": args.service_max_concurrency,
         "concurrency": args.concurrency,
         "repeat": args.repeat,
         "mode": args.mode,
