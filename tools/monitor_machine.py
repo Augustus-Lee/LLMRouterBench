@@ -49,9 +49,9 @@ CPU_RE = re.compile(
     re.IGNORECASE,
 )
 SWAP_RE = re.compile(
-    r"total:\s*([\d.]+)\s*([MG])i?B?\s+"
-    r"used:\s*([\d.]+)\s*([MG])i?B?\s+"
-    r"free:\s*([\d.]+)\s*([MG])i?B?",
+    r"total\s*[:=]\s*([\d.]+)\s*([MG])i?B?\s+"
+    r"used\s*[:=]\s*([\d.]+)\s*([MG])i?B?\s+"
+    r"free\s*[:=]\s*([\d.]+)\s*([MG])i?B?",
     re.IGNORECASE,
 )
 
@@ -191,13 +191,15 @@ def load_gpu_series(path: str) -> List[Dict[str, float]]:
     return rows
 
 
-GPU_RES_RE = re.compile(r"GPU active residency:\s*([\d.]+)%")
+GPU_RES_RE = re.compile(r"GPU (?:HW )?active residency:\s*([\d.]+)%", re.IGNORECASE)
 GPU_POWER_RE = re.compile(r"GPU Power:\s*([\d.]+)\s*mW", re.IGNORECASE)
 ANE_POWER_RE = re.compile(r"ANE Power:\s*([\d.]+)\s*mW", re.IGNORECASE)
-ANE_RES_RE = re.compile(r"ANE (?:active residency|duty cycle):\s*([\d.]+)%", re.IGNORECASE)
+ANE_RES_RE = re.compile(r"ANE (?:HW )?(?:active residency|duty cycle):\s*([\d.]+)%", re.IGNORECASE)
 GPU_FREQ_RE = re.compile(r"GPU HW active frequency:\s*([\d.]+)\s*MHz", re.IGNORECASE)
 ANE_FREQ_RE = re.compile(r"ANE HW active frequency:\s*([\d.]+)\s*MHz", re.IGNORECASE)
-THERMAL_RE = re.compile(r"Thermal pressure:\s*(\w+)", re.IGNORECASE)
+THERMAL_RE = re.compile(r"(?:Thermal pressure|Current pressure level):\s*(\w+)", re.IGNORECASE)
+CLUSTER_RES_RE = re.compile(r"(P\d-Cluster|E-Cluster) HW active residency:\s*([\d.]+)%")
+CLUSTER_FREQ_RE = re.compile(r"(P\d-Cluster|E-Cluster) HW active frequency:\s*([\d.]+)\s*MHz")
 POWER_SAMPLE_SPLIT_RE = re.compile(
     r"(?=^\*\*\* Sampled system activity \([^\n]+\) \*\*\*$)",
     re.MULTILINE,
@@ -216,8 +218,18 @@ def split_powermetrics_samples(text: str) -> List[str]:
 
 
 def parse_powermetrics_sample(text: str) -> Dict[str, Optional[Any]]:
-    """解析一个 powermetrics 采样块；缺失字段保留 None，不补 0。"""
+    """解析一个 powermetrics 采样块；缺失字段保留 None，不补 0。
+
+    CPU 大小核簇（P/E Cluster）residency 与频率来自 cpu_power 采样器，
+    以 ``cpu_clusters`` 字典形式返回（键为 cluster 名，如 "P0-Cluster"/"E-Cluster"）；
+    采样器未启用 cpu_power 或解析失败时为空字典。
+    """
     thermal = THERMAL_RE.search(text)
+    clusters: Dict[str, Dict[str, Optional[float]]] = {}
+    for m in CLUSTER_RES_RE.finditer(text):
+        clusters.setdefault(m.group(1), {})["residency_percent"] = float(m.group(2))
+    for m in CLUSTER_FREQ_RE.finditer(text):
+        clusters.setdefault(m.group(1), {})["freq_mhz"] = float(m.group(2))
     return {
         "gpu_usage_percent": _first_match(GPU_RES_RE, text),
         "gpu_power_mw": _first_match(GPU_POWER_RE, text),
@@ -226,6 +238,7 @@ def parse_powermetrics_sample(text: str) -> Dict[str, Optional[Any]]:
         "npu_usage_percent": _first_match(ANE_RES_RE, text),
         "npu_freq_mhz": _first_match(ANE_FREQ_RE, text),
         "thermal_pressure": thermal.group(1) if thermal else None,
+        "cpu_clusters": clusters,
     }
 
 
@@ -631,6 +644,18 @@ def make_charts(rows: List[Dict[str, Any]], out_dir: str) -> List[str]:
               "gpu_frequency.png", "GPU active frequency over time")
         plot(*series(["gpu", "npu_freq_mhz"]), "NPU frequency (MHz)",
               "npu_frequency.png", "NPU active frequency over time")
+        cluster_names = sorted({
+            name
+            for r in rows
+            for name in ((r.get("gpu") or {}).get("cpu_clusters") or {}).keys()
+        })
+        for name in cluster_names:
+            plot(*series(["gpu", "cpu_clusters", name, "residency_percent"]),
+                 f"{name} residency (%)", f"cpu_cluster_{name}_residency.png",
+                 f"{name} CPU cluster residency over time")
+            plot(*series(["gpu", "cpu_clusters", name, "freq_mhz"]),
+                 f"{name} frequency (MHz)", f"cpu_cluster_{name}_frequency.png",
+                 f"{name} CPU cluster frequency over time")
     if any(r.get("compute") for r in rows):
         plot(*series(["compute", "prefill_effective_tflops"]), "Prefill effective TFLOPS",
               "prefill_effective_tflops.png", "Prefill effective TFLOPS over time")

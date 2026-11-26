@@ -3,7 +3,7 @@
 
 组合目标（用户需求）：
   - query 来源：collect_local_882.py 的 DeepSeek 882 题（(dataset_id, record_index) 严格对齐）
-  - 并发阶梯：bench_multi_query.py 的 1→2→4→… 并发 + 计时 + 退避重试
+  - 并发阶梯：bench_multi_query.py 的 1→2→4→8 四档并发 + 计时 + 退避重试
   - 判分：复用原生 evaluator（选项匹配 / 数学判分 / LLM judge），非正则粗 hit
 
 与两个源脚本的关键差异：
@@ -47,7 +47,7 @@ except ImportError:  # python tools/bench_accuracy_concurrency.py 直跑
         BenchRequestError, OpenAICompatClient, SystemMonitor, detect_hardware, summarize_repeats)
     from monitor_machine import derive_phase_effective_rates  # type: ignore
 
-DEFAULT_CONCURRENCY = "1,2,4"
+DEFAULT_CONCURRENCY = "1,2,4,8"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -180,7 +180,8 @@ def clamp_concurrency(ladder: List[int], service_max: Optional[int]
 
 def make_request_record(query: Dict[str, Any], raw: Dict[str, Any],
                         eval_result: Optional[Dict[str, Any]],
-                        mode: str, attempt_index: int = 0,
+                        mode: str, model_name: Optional[str] = None,
+                        attempt_index: int = 0,
                         retry_count: int = 0) -> Dict[str, Any]:
     """单次请求 + 判分结果 -> 统一记录。
 
@@ -188,6 +189,15 @@ def make_request_record(query: Dict[str, Any], raw: Dict[str, Any],
       - 请求失败：success=False，is_correct=None，fail_reason=客户端错误信息；
       - 请求成功但判分抛错：success=True，is_correct=None，fail_reason="scoring_error"；
       - 判分成功：is_correct 取 bool(eval_result["is_correct"])（None 保持 None）。
+
+    需求字段映射（端侧精品模型测试指标）：
+      - sample_id = "{dataset_id}:{record_index}"；eval_name = dataset_id；
+      - correct：is_correct 的 int 表示（True->1 / False->0 / None->None）；
+      - error：成功为空字符串，失败/判分错误与 fail_reason 同值；
+      - prefill_tokens = prompt_tokens - cache_hit_tokens（缓存信息缺失时 = prompt_tokens）；
+      - decode_tokens = completion_tokens；
+      - reasoning_tokens / cache_status / cache_hit_tokens 由客户端从服务端
+        usage 提取（Splash 已验证支持），缺失保持 None，不默认 0。
     """
     success = bool(raw.get("success"))
     is_correct: Optional[bool] = None
@@ -202,19 +212,39 @@ def make_request_record(query: Dict[str, Any], raw: Dict[str, Any],
             fail_reason = "scoring_error"
     else:
         fail_reason = raw.get("error") or "request_failed"
+
+    prompt_tokens = raw.get("prompt_tokens")
+    completion_tokens = raw.get("completion_tokens")
+    cache_status = raw.get("cache_status")
+    cache_hit_tokens = raw.get("cache_hit_tokens")
+    prefill_tokens = None
+    if prompt_tokens is not None:
+        prefill_tokens = (prompt_tokens - cache_hit_tokens
+                          if isinstance(cache_hit_tokens, int) else prompt_tokens)
+
     return {
+        "sample_id": f"{query['dataset_id']}:{query['record_index']}",
+        "eval_name": query["dataset_id"],
+        "model_name": model_name,
         "dataset_id": query["dataset_id"],
         "record_index": query["record_index"],
         "prompt": query["prompt"],
         "response": raw.get("content"),
         "is_correct": is_correct,
+        "correct": (None if is_correct is None else int(is_correct)),
         "prediction": prediction,
         "ground_truth": query["ground_truth"],
         "fail_reason": fail_reason,
+        "error": ("" if fail_reason is None else fail_reason),
         "success": success,
         "finish_reason": raw.get("finish_reason"),
-        "prompt_tokens": raw.get("prompt_tokens"),
-        "completion_tokens": raw.get("completion_tokens"),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": raw.get("reasoning_tokens"),
+        "cache_status": cache_status,
+        "cache_hit_tokens": cache_hit_tokens,
+        "prefill_tokens": prefill_tokens,
+        "decode_tokens": completion_tokens,
         "prefill_tok_per_s": raw.get("prefill_tok_per_s"),
         "decode_tok_per_s": raw.get("decode_tok_per_s"),
         "prefill_s": raw.get("prefill_s"),
@@ -426,12 +456,14 @@ def run_one(client: OpenAICompatClient, query: Dict[str, Any], evaluator: Any,
                 except Exception:
                     eval_result = None
             record = make_request_record(query, raw, eval_result, mode,
+                                         model_name=args.engine,
                                          attempt_index=attempt, retry_count=attempt)
             if record["success"]:
                 return record
         except BenchRequestError as exc:
             raw = {"success": False, "content": None, "error": str(exc)}
             record = make_request_record(query, raw, None, mode,
+                                         model_name=args.engine,
                                          attempt_index=attempt, retry_count=attempt)
         if attempt < max_attempts - 1:
             time.sleep(min(30.0, backoff_base * (2 ** attempt)))
@@ -597,7 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-error-rate", type=float, default=0.3,
                    help="错误率熔断阈值（0~1），默认 0.3")
     p.add_argument("--concurrency", type=parse_concurrency, default=parse_concurrency(DEFAULT_CONCURRENCY),
-                   help="并发阶梯，默认 1,2,4")
+                   help="并发阶梯，默认 1,2,4,8（四档，最大并发 8）")
     p.add_argument("--repeat", type=int, default=1, help="每个 query 每 mode 重复次数")
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--backoff-base-s", type=float, default=1.0)
