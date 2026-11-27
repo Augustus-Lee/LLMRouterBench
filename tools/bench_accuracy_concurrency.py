@@ -345,6 +345,14 @@ def compute_stage_summary(
     ct = [r.get("completion_tokens") for r in ok if r.get("completion_tokens") is not None]
     total_prompt = sum(pt) if pt else None
     total_completion = sum(ct) if ct else None
+    pref = [r.get("prefill_tokens") for r in ok if r.get("prefill_tokens") is not None]
+    dec = [r.get("decode_tokens") for r in ok if r.get("decode_tokens") is not None]
+    ch = [r.get("cache_hit_tokens") for r in ok if r.get("cache_hit_tokens") is not None]
+    reas = [r.get("reasoning_tokens") for r in ok if r.get("reasoning_tokens") is not None]
+    total_prefill = sum(pref) if pref else None
+    total_decode = sum(dec) if dec else None
+    total_cache_hit = sum(ch) if ch else None
+    total_reasoning = sum(reas) if reas else None
     tokens_per_s = None
     if wall_s > 0 and (total_prompt is not None or total_completion is not None):
         tokens_per_s = round(((total_prompt or 0) + (total_completion or 0)) / wall_s, 2)
@@ -378,6 +386,10 @@ def compute_stage_summary(
         "requests_per_s": round(len(ok) / wall_s, 3) if wall_s > 0 else None,
         "total_prompt_tokens": total_prompt,
         "total_completion_tokens": total_completion,
+        "total_prefill_tokens": total_prefill,
+        "total_decode_tokens": total_decode,
+        "total_cache_hit_tokens": total_cache_hit,
+        "total_reasoning_tokens": total_reasoning,
         "tokens_per_s": tokens_per_s,
         "input_tokens_per_s": input_tokens_per_s,
         "output_tokens_per_s": output_tokens_per_s,
@@ -563,6 +575,24 @@ def render_markdown(stages: List[Dict[str, Any]], query_count: int) -> str:
             f"| {s['concurrency']} | {acc} | {s['n_scored']} | {s['success_requests']} "
             f"| {s.get('success_rate') or '-'} | {s.get('requests_per_s') or '-'} "
             f"| {s.get('decode_tok_per_s_mean') or '-'} | {ttft} | {s['error_requests']} |")
+    lines += [
+        "",
+        "## Token 统计（对齐端侧精品模型指标口径）",
+        "",
+        "> prefill_tokens = prompt_tokens − cache_hit_tokens；decode_tokens = completion_tokens。",
+        "",
+        "| 并发 | prompt | prefill | cache_hit | completion(=decode) | reasoning |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for s in stages:
+        def tfmt(v):
+            return str(v) if v is not None else "-"
+        lines.append(
+            f"| {s['concurrency']} | {tfmt(s.get('total_prompt_tokens'))} "
+            f"| {tfmt(s.get('total_prefill_tokens'))} "
+            f"| {tfmt(s.get('total_cache_hit_tokens'))} "
+            f"| {tfmt(s.get('total_completion_tokens'))} "
+            f"| {tfmt(s.get('total_reasoning_tokens'))} |")
     lines += [
         "",
         "## 有效算力与有效带宽（workload-level 推导值）",

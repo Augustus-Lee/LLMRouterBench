@@ -198,8 +198,8 @@ ANE_RES_RE = re.compile(r"ANE (?:HW )?(?:active residency|duty cycle):\s*([\d.]+
 GPU_FREQ_RE = re.compile(r"GPU HW active frequency:\s*([\d.]+)\s*MHz", re.IGNORECASE)
 ANE_FREQ_RE = re.compile(r"ANE HW active frequency:\s*([\d.]+)\s*MHz", re.IGNORECASE)
 THERMAL_RE = re.compile(r"(?:Thermal pressure|Current pressure level):\s*(\w+)", re.IGNORECASE)
-CLUSTER_RES_RE = re.compile(r"(P\d-Cluster|E-Cluster) HW active residency:\s*([\d.]+)%")
-CLUSTER_FREQ_RE = re.compile(r"(P\d-Cluster|E-Cluster) HW active frequency:\s*([\d.]+)\s*MHz")
+CLUSTER_RES_RE = re.compile(r"((?:P\d|E|S)-Cluster) HW active residency:\s*([\d.]+)%")
+CLUSTER_FREQ_RE = re.compile(r"((?:P\d|E|S)-Cluster) HW active frequency:\s*([\d.]+)\s*MHz")
 POWER_SAMPLE_SPLIT_RE = re.compile(
     r"(?=^\*\*\* Sampled system activity \([^\n]+\) \*\*\*$)",
     re.MULTILINE,
@@ -250,6 +250,34 @@ def parse_powermetrics_text(text: str) -> List[Dict[str, Optional[Any]]]:
     """
     return [parse_powermetrics_sample(block)
             for block in split_powermetrics_samples(text)]
+
+
+def derive_gpu_effective_utilization(
+        gpu: Optional[Dict[str, Any]],
+        max_freq_mhz: Optional[float]) -> Optional[Dict[str, Any]]:
+    """在 GPU 采样上追加「有效频率利用率」等派生字段。
+
+    公式：effective_utilization = active_residency × active_freq / max_freq_mhz。
+    这是频率加权活跃率（捕捉 DVFS 降频），不是 ALU 吞吐利用率——Apple Silicon
+    无该硬件计数器，访存密集负载下 active_residency 接近 100%，该值退化为
+    频率利用率。max_freq_mhz 缺失/<=0 或 gpu 无对应字段时，派生字段保持 None。
+    """
+    if not isinstance(gpu, dict):
+        return gpu
+    out = dict(gpu)
+    freq = out.get("gpu_freq_mhz")
+    residency = out.get("gpu_usage_percent")
+    freq_util: Optional[float] = None
+    effective_util: Optional[float] = None
+    if max_freq_mhz and max_freq_mhz > 0 and freq is not None:
+        freq_util = round(float(freq) / float(max_freq_mhz) * 100.0, 2)
+        if residency is not None:
+            effective_util = round(
+                float(residency) * float(freq) / float(max_freq_mhz), 2)
+    out["gpu_freq_utilization_percent"] = freq_util
+    out["gpu_effective_utilization_percent"] = effective_util
+    out["gpu_max_freq_mhz"] = max_freq_mhz
+    return out
 
 
 class PowermetricsTail:
@@ -532,7 +560,8 @@ def build_final_metrics_row(
         compute: Dict[str, Any],
         compute_static: Dict[str, Any],
         timestamp: float,
-        wall_time: float) -> Dict[str, Any]:
+        wall_time: float,
+        gpu_max_freq_mhz: Optional[float] = None) -> Dict[str, Any]:
     """以最后一个完整系统采样为基底构造退出汇总行。
 
     powermetrics 的最终补读只提供 GPU/NPU 字段；退出行仍必须保留最近一次
@@ -542,7 +571,7 @@ def build_final_metrics_row(
     row = copy.deepcopy(last_sample) if last_sample else {}
     row.pop("final_drain", None)
     if latest_gpu is not None:
-        row["gpu"] = copy.deepcopy(latest_gpu)
+        row["gpu"] = derive_gpu_effective_utilization(latest_gpu, gpu_max_freq_mhz)
     row["timestamp"] = round(timestamp, 3)
     row["wall_time"] = round(wall_time, 3)
     row["compute"] = copy.deepcopy(compute)
@@ -686,6 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chart", action="store_true", help="输出 PNG 图表")
     parser.add_argument("--gpu-file", default=None,
                         help="外部 GPU/NPU CSV 时序文件：timestamp,gpu_usage_percent,npu_usage_percent")
+    parser.add_argument("--gpu-max-freq-mhz", type=float, default=1620.0,
+                        help="GPU 峰值频率参考（MHz），用于推导有效频率利用率；"
+                             "0 或负值表示不推导，默认 1620")
     parser.add_argument("--powermetrics-file", default=None,
                         help="sudo powermetrics 文本输出；自动提取 GPU/NPU/温控")
     parser.add_argument("--follow-powermetrics", action="store_true",
@@ -811,6 +843,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "start_workload_at_end": args.start_workload_at_end,
         "quantization": args.quantization,
         "gpu_file": args.gpu_file,
+        "gpu_max_freq_mhz": args.gpu_max_freq_mhz,
         "powermetrics_file": args.powermetrics_file,
         "follow_powermetrics": args.follow_powermetrics,
         "start_at_end": args.start_at_end,
@@ -860,13 +893,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             sample["timestamp"] = round(t, 3)
             sample["wall_time"] = round(time.time(), 3)
             if latest_gpu is not None:
-                sample["gpu"] = dict(latest_gpu)
+                sample["gpu"] = derive_gpu_effective_utilization(
+                    latest_gpu, args.gpu_max_freq_mhz)
             else:
                 nearest = min(gpu_by_t.keys(), key=lambda x: abs(x - t)) if gpu_by_t else None
                 if nearest is not None:
                     g = dict(gpu_by_t[nearest])
                     g.pop("timestamp", None)
-                    sample["gpu"] = g
+                    sample["gpu"] = derive_gpu_effective_utilization(
+                        g, args.gpu_max_freq_mhz)
                 else:
                     sample["gpu"] = None
             events_in_window = (int((live_compute or {}).get("events_in_window") or 0)
@@ -910,7 +945,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for gpu_sample in drained_gpu:
         drain_row = build_final_metrics_row(
             last_sample, gpu_sample, drained_compute, compute_baseline,
-            time.monotonic() - started, time.time())
+            time.monotonic() - started, time.time(), args.gpu_max_freq_mhz)
         rows.append(drain_row)
         metrics_f.write(json.dumps(drain_row, ensure_ascii=False, sort_keys=True) + "\n")
         metrics_f.flush()
@@ -919,7 +954,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 最终汇总行保留退出时的滑动窗口状态，供图表和阶段汇总使用。
         final_row = build_final_metrics_row(
             last_sample, latest_gpu, final_compute, compute_baseline,
-            time.monotonic() - started, time.time())
+            time.monotonic() - started, time.time(), args.gpu_max_freq_mhz)
         rows.append(final_row)
         metrics_f.write(json.dumps(final_row, ensure_ascii=False, sort_keys=True) + "\n")
         metrics_f.flush()

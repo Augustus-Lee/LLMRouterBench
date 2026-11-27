@@ -1,7 +1,7 @@
 # AGENTS.md — LLMRouterBench 跨会话记忆
 
 > 本文件是 Codex 在本仓库工作的长期上下文入口。新会话先读这里，再按需读 `README_zh.md` 和 `docs/`。
-> 最后核对：2026-11-25（Asia/Shanghai）。状态会变化，涉及远端机器、模型服务、未提交文件时先重新核实。
+> 最后核对：2026-11-26（Asia/Shanghai）。状态会变化，涉及远端机器、模型服务、未提交文件时先重新核实。
 
 ## 1. 用户与仓库约定
 
@@ -12,7 +12,8 @@
 - 上游项目：`https://github.com/meijamke/LLMRouterBench.git`（`upstream`）
 - 用户 fork：`https://github.com/Augustus-Lee/LLMRouterBench.git`（`origin`）
 - 当前分支：`main`，跟踪 `origin/main`
-- 本次核对时 HEAD：`af344b7 route: 端侧大模型 9B→14B，LLM分类改用prompt输入，修复data_loader UTF-8读取`
+- 本次核对时 HEAD：`6805b5d bench: 补齐端侧精品模型测试指标字段(P1)+CPU簇监控(P3)`
+- 当前默认只在 `macmini-m5-jiuwen` 上做端侧大模型评测；不主动连接其他机器。
 - 代码修改默认从最新 `origin/main` 开 `codex/` 前缀分支；不要直接向上游 `upstream` 推送。
 - 提交前先看 `git status`：工作区可能已有用户未提交的文档，不能擅自删除、覆盖或混入无关提交。
 
@@ -35,7 +36,7 @@
 
 路由评估不需要在回放时重新调用回答模型；因此完整答案矩阵是最重要的中间资产。
 
-官方框架规模约为 33 个模型、21+ 数据集、10 种路由算法。**本地二次开发重点不是复刻全部官方实验，而是端侧/云端路由。**
+官方框架规模约为 33 个模型、21+ 数据集、10 种路由算法。**当前本地工作重点不是复刻全部官方实验，也不是云端路由，而是端侧大模型评测；云端路由仅在用户明确要求时恢复。**
 
 ## 3. 本地二次开发主线
 
@@ -55,22 +56,14 @@
 历史 XRouter 回放矩阵是 **882 题**：`gpqa/mmlupro/math500/arcc` 各 150，`gsm8k` 100，`mmlu` 182。
 不要把它和当前全量数据条数混用。新增回放必须按 `(dataset_id, record_index)` 严格对齐。
 
-### 3.2 当前 5 模型答案池
+### 3.2 当前端侧评测目标
 
-当前端侧分析代码中的模型池：
+- 主测：`Qwen3.8-27B`（GGUF Q4_K_M，Splash/18080）。
+- 可用冒烟/对照：`qwen3.6:35b-a3b-q4_K_M`（Ollama/11435）。
+- 云端：`DeepSeek-V4.1-Flash` 仅在用户明确要求路由/云端对比时使用。
+- 端侧模型离线回放成本按 **0** 计；云端计费仍按硅基流动真实价格：输入 ¥2.00 / M tokens，输出 ¥8.00 / M tokens。
 
-- 端侧候选：`Qwen3.5-4B`、`Qwen3-8B`、`Qwen3-14B`、`Qwen3.5-9B`
-- 云端：`DeepSeek-V4.1-Flash`
-
-端侧模型的离线回放成本按 **0** 计（电力、折旧等暂不计）；云侧按硅基流动真实价格计：
-
-```text
-DeepSeek-V4.1-Flash: 输入 ¥2.00 / M tokens，输出 ¥8.00 / M tokens
-```
-
-成本口径是用户明确修正过的，不要改回 API 代跑价。`Qwen3.5-4B/8B/9B/14B` 在回放中均视为端侧 0 成本。
-
-### 3.3 XRouter 三角色语义
+### 3.3 历史 XRouter 三角色语义（暂不作为主线）
 
 ```text
 提问
@@ -87,134 +80,94 @@ DeepSeek-V4.1-Flash: 输入 ¥2.00 / M tokens，输出 ¥8.00 / M tokens
 
 ### 3.4 已实现的关键能力
 
-- 端侧 4 模型 + 云侧 DeepSeek 的 882 题答案矩阵与离线回放；
-- LLM/启发式两套难度分类；
-- `SIMPLE` 到 `NONE` 的能力阈值扫描与质量-成本 Pareto；
-- 单模型、AVG、Random、MaxExpert、Category Expert、Oracle 基线；
-- MMLU/MMLU-Pro 的 `category` 字段贯通，支持 subject 粒度 Category Expert；
-- 端侧成本=0 的统一重算；
-- 分类器限流处理：长超时、并发控制和退避重试。
+- 882 题抽样清单与 6 个数据集的能力评测链路；
+- 单/多并发、流式/非流式请求评测；
+- CPU/GPU/NPU/内存/swap/powermetrics 机器监控；
+- 逐请求字段覆盖率统计与图表；
+- 2048/4096 输出上限的准确率、吞吐、TTFT/E2E 对比报告；
+- 端侧单机评测报告生成链路（HTML / Markdown）。
 
-## 4. 重要代码与配置入口
 
-```text
-data_collector/cli.py                 Collector CLI
-data_collector/config_loader.py       配置加载
-data_collector/planner.py             dataset × split × model 运行计划
-data_collector/runner.py              单次采集、判分、落盘
-evaluation/factory.py                 Evaluator 注册表
-baselines/data_loader.py              读取 results/bench，构建 BaselineRecord
-baselines/schema.py                   BaselineRecord / AggregatedStats
-baselines/aggregators.py              AVG/Random/MaxExpert/CategoryExpert/Oracle
-baselines/device_llm_router.py        XRouter 分类、档位与启发式逻辑
-baselines/adaptors/                   各路由算法的数据适配
-```
+## 4. 当前端侧评测代码与配置入口
 
-端侧专用配置与脚本：
+当前主要使用端侧性能/能力评测链路，路由相关文件保留但不再是默认入口。
 
 ```text
-config/edge_router_config.yaml        4 端侧模型 + DeepSeek，6 数据集
-config/edge_router_3model.yaml        仅补采 Qwen3.5-9B
-config/baseline_config_edge.yaml      端侧答案矩阵加载配置
-tools/collect_9b_882.py               按旧矩阵索引补采 9B
-tools/run_xrouter_classifier.py       4B 难度分类并写 tiers CSV
-tools/eval_device_llm_router_3model.py  两模型三角色回放
-tools/eval_3model_full.py             5 模型全基线 + 3 张图
-tools/eval_3model_sweep.py            能力阈值扫描 + Pareto
-tools/verify_category_expert.py       Category Expert 独立交叉验证
-tools/run_edge_analysis.py            一键端侧分析入口
+tools/bench_accuracy_concurrency.py  端侧能力+性能并发阶梯评测
+tools/monitor_machine.py             CPU/GPU/NPU/内存/swap/powermetrics 监控
+tools/bench_common.py                请求计时、流式解析、逐请求字段
+tools/bench_splash.py                Splash 探活/基础请求
+tools/resource_stressor.py           可选资源占用对照实验
+tools/sample_882.py                  生成/维护 882 题抽样清单
+tools/summarize.py                   结果汇总入口之一
+config/local_model_eval.yaml         本地模型评测基础配置
 ```
 
-主要输出（多数被 `.gitignore`）：
+历史路由文件仍存在，但当前不在默认工作面：
+`baselines/device_llm_router.py`、`baselines/aggregators.py`、`tools/eval_3model_*.py`。
 
-```text
-results/bench/                        原始采集结果矩阵，当前工作区缺失
-results/xrouter_classifier_tiers.csv  4B 分类档位（已提交）
-results/devllmr_3model_pareto.png      Pareto 图（已提交）
-results/xrouter_comparison.png        启发式/LLM/基线对比图（已提交）
-results/xrouter_heur_classification.png
-results/xrouter_llm_classification.png
-```
-
-## 5. 常用命令
+## 5. 当前端侧评测常用命令
 
 ```bash
-# 环境
+# 仓库环境
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# 数据（仓库用 Git LFS）
 git lfs install
+
+# 数据
 git lfs pull
 
-# 采集器
-python -m data_collector.cli list
-python -m data_collector.cli run config/edge_router_config_demo.yaml -y
-python -m data_collector.cli run config/edge_router_3model.yaml -y
+# 端侧能力/性能评测（示例：单并发流式）
+python tools/bench_accuracy_concurrency.py \
+  --engine splash-qwen38 \
+  --host 127.0.0.1 --port 18080 \
+  --query-source manifest \
+  --manifest <sample_882.jsonl> \
+  --concurrency 1 \
+  --mode stream \
+  --max-output-tokens 4096 \
+  --temperature 0.0 \
+  --seed 42 \
+  --out results/<run_id>
 
-# XRouter 回放（需要 results/bench 和 tiers CSV）
-python tools/run_xrouter_classifier.py
-python tools/run_xrouter_classifier.py --retry-failed --concurrency 6
-python tools/eval_3model_full.py
-python tools/eval_3model_sweep.py
+# 监控（一般与评测并行启动）
+python tools/monitor_machine.py \
+  --out results/<run_id>/monitor/stream/metrics.jsonl \
+  --interval 2 \
+  --duration 21600 \
+  --follow-powermetrics \
+  --powermetrics-file results/powermetrics_qwen38.txt
 
-# 轻量静态检查
-python -m compileall -q baselines data_collector evaluation tools
+# 冒烟测试建议
+#   --limit-per-dataset 1 或 --limit-per-dataset 3
+#   --max-output-tokens 512 或 1024
+#   --concurrency 1 --mode stream
 ```
 
-需要的环境变量名（只写名字，不记录值）：
+注意：`sudo powermetrics` 属于提权命令，执行前必须先获得用户批准；不要在未授权时采集。
 
-```text
-SILICONFLOW_API_KEY       端侧实验的硅基流动 API Key
-OPENROUTER_API_KEY
-HUOSHAN_API_KEY
-OPENAI_API_KEY
-GRADER_API_KEY / GRADER_BASE_URL / GRADER_MODEL_NAME
-ARENA_GRADER_API_KEY / ARENA_GRADER_BASE_URL / ARENA_GRADER_MODEL_NAME
-MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD
-```
+## 6. 当前评测机器（仅 jiuwen）
 
-## 6. 三台 Mac mini 环境
+当前默认只在 `macmini-m5-jiuwen` 上做端侧评测。除非用户明确点名，不主动连接其他 Mac mini。
 
-三台机器统一为 64GB 统一内存：
+| 项目 | 值 |
+|---|---|
+| SSH alias | `macmini-m5-jiuwen` |
+| IP | `192.168.3.5` |
+| 用户 | `jiuwen` |
+| 硬件 | Apple M5 Pro，20 核 GPU，64GB 统一内存 |
+| 角色 | 端侧大模型能力/性能评测主测机 |
+| 最近记录 | `Ollama 127.0.0.1:11435` 服务 `qwen3.6:35b-a3b-q4_K_M`；Splash/18080 是否在线需每次重新核实 |
 
-| SSH alias | IP | 用户 | 硬件 | 角色 |
-|---|---|---|---|---|
-| `macmini` | `192.168.3.13` | `synco` | M5 Pro 64GB | 已运行 Qwen3.8-27B + 35B-A3B，重点评测机 |
-| `macmini-m5-jiuwen` | `192.168.3.5` | `jiuwen` | M5 Pro 64GB | Qwen3.8-27B、35B-A3B 基线 |
-| `macmini-m4-admin` | `192.168.3.7` | `admin` | M4 Pro 64GB | Gemma-4-26B-A4B、35B-A3B、M4 对照 |
+说明：
+- `NVIDIA PAIR` 只是聚合/代理层，不能仅凭 model inventory 判断权重已安装。
+- 正式评测必须记录模型仓库/revision、量化、文件大小、引擎版本、上下文、KV cache、并发、预热、采样参数、峰值内存、swap。
+- 3.13 和 3.7 机器是历史资料，当前默认不连接、不评测。
 
-已验证：
+## 7. AI 连接远端 Mac（当前默认 jiuwen）的强制安全规范
 
-- 三台均已配置免密 SSH；私钥只在本机 `~/.ssh/id_ed25519`，不要复制进仓库。
-- 3.13 当前有 Splash `127.0.0.1:18080` 服务 Qwen3.8-27B GGUF Q4_K_M；
-- 3.13 有 Ollama `127.0.0.1:11435` 服务 `qwen3.6:35b-a3b-q4_K_M`；
-- NVIDIA PAIR 是聚合/代理层，**不能仅凭 PAIR 列出的 model inventory 判断权重已安装**；
-- 3.13 磁盘紧张（约 63GiB 可用），Splash 常驻内存约 22GiB；测别的模型前先错峰/释放。
-
-长期结论：
-
-- 20B～35B 级模型用 4bit 在这三台机器上可行；
-- `Qwen3.8-Flash-125B-A6B` 的 Q4 约 65～75GB，不适合作为 64GB 单机稳定基线；
-- 125B 只能做 IQ2/Q2、4k～8k、单并发实验，并明确标为实验性；
-- 不同推理引擎（MLX-LM、Splash、Ollama、oMLX、llama.cpp、LM Studio）的 TTFT/Decode 不可直接横比；
-- 正式性能结果必须记录模型仓库/revision、量化、实际文件大小、引擎版本、上下文、KV cache、并发、预热、采样参数、峰值内存、swap。
-
-优先阅读：
-
-```text
-docs/三台MacMini_配置与模型部署可行性评估.md   # 三台机器的权威汇总
-docs/MacMini_已装模型清单.md                  # 3.13 的详细服务与模型快照
-docs/MAC_文本模型性能评测方案.md              # Mac 性能评测方案
-docs/SSH_连接说明.md                          # 3.13 的连接与工作流
-```
-
-注意：`docs/MacMini_已装模型清单.md` 内有一处旧链接写成了不存在的 `两台MacMini_...`，实际文件是 `三台MacMini_...`。
-
-## 7. AI 连接 Mac mini 的强制安全规范
-
-> **适用范围：** AI 通过 SSH、`scp`、`rsync`、远程命令、远程 API/端口转发或图形界面连接 `macmini`、`macmini-m5-jiuwen`、`macmini-m4-admin` 及其他远端机器时，均必须遵守本节。其优先级高于本文件后续命令示例和效率偏好；如有冲突，以本节为准。
+> **适用范围：** AI 通过 SSH、`scp`、`rsync`、远程命令、远程 API/端口转发或图形界面连接 `macmini-m5-jiuwen` 时，均必须遵守本节；如确需访问其他机器，必须先由用户明确点名。本节优先级高于本文件后续命令示例和效率偏好；如有冲突，以本节为准。
 >
 > **核心原则：监控与只读检查从宽；在批准工作区内新建普通文件/目录从宽；删除、覆盖、系统变更和重资源操作从严；无法确认时停止并询问。**
 >
@@ -233,7 +186,6 @@ docs/SSH_连接说明.md                          # 3.13 的连接与工作流
 - R0 和合规 R1 操作不需要逐次批准；一次批准只覆盖指定主机和指定 R2 操作，不得扩大到其他主机或后续批量动作。
 - 不得把多条 R2 有副作用命令串联后用一个“总命令”规避逐项确认，例如用 `&&`、`;`、`eval`、`bash -c`、base64 或临时脚本隐藏真实动作。R0/R1 的只读采样和普通产物创建不在此限制内。
 - 用户未明确授权时，AI 可执行 R0 和合规 R1，但不得执行 R2。
-- `sudo`、`su`操作需要询问，进行批准之后才可操作
 
 ### 7.2 绝对禁止：删除目录与系统级变更
 
@@ -244,7 +196,7 @@ docs/SSH_连接说明.md                          # 3.13 的连接与工作流
 - **提权与系统配置：** 修改 `/etc`、`/Library`、`/System`、`/usr`、`/private`、系统 LaunchDaemon/LaunchAgent、SSH 服务配置、防火墙、共享服务、用户/组、SIP、内核扩展、系统代理和网络配置。
 - **系统状态变更：** `softwareupdate`、`systemsetup`、`defaults write`、`pmset` 写操作、`diskutil` 写操作、`nvram`、分区/格式化/挂载变更、关机、重启、注销、强制休眠或清空系统缓存。
 - **软件安装：** 未经 R2 批准，不得运行 `brew install/uninstall/upgrade`、`pip install` 到系统环境、卸载系统软件或修改登录项。优先使用项目专用虚拟环境。
-- **进程与服务：** 不得使用 `kill`、`pkill`、`killall`、`launchctl bootout` 等停止他人服务；不得停止 Ollama、Splash、MLX、PAIR 等共享服务。只能停止本次任务明确启动且已记录 PID 的进程，并须事先批准。
+- **进程与服务：** 不得使用 `kill`、`pkill`、`killall`、`launchctl bootout` 等停止他人服务；只能停止本次任务明确启动且已记录 PID 的进程，并须事先批准。
 - **凭据安全：** 不得读取、复制、打印、上传私钥，不得把密码、token、API Key 写入命令、日志、Git 或文档；不得执行从网络直接管道到 shell 的脚本，如 `curl ... | sh`。
 - **未知脚本：** 不得在未阅读源码和说明的情况下运行可能删除、覆盖、安装或修改系统的脚本。先查看 `--help`、README 和关键写操作；普通产物创建可按 R1 执行，其余副作用按 R2 申请。
 
@@ -255,17 +207,17 @@ docs/SSH_连接说明.md                          # 3.13 的连接与工作流
 在不泄露敏感信息的前提下，AI 可直接执行常用监控命令，无需逐次审批。典型命令包括：
 
 ```bash
-ssh <alias> 'hostname; whoami; pwd; sw_vers; uname -m'
-ssh <alias> 'system_profiler SPHardwareDataType'
-ssh <alias> 'df -h /; vm_stat; sysctl hw.memsize'
-ssh <alias> 'ps -axo pid,user,%cpu,%mem,rss,etime,comm | head -n 80'
-ssh <alias> 'top -l 3 -s 1 -stats pid,user,cpu,mem,command'
-ssh <alias> 'vm_stat; memory_pressure; sysctl vm.swapusage; sysctl hw.memsize'
-ssh <alias> 'df -h /; iostat -d -w 1 -c 3; netstat -an | head -n 80'
-ssh <alias> 'pgrep -afil "ollama|splash|mlx"'
-ssh <alias> 'lsof -nP -iTCP -sTCP:LISTEN'
-ssh <alias> 'tail -n 100 <明确指定的日志文件>'
-ssh <alias> 'curl -fsS http://127.0.0.1:<port>/health'
+ssh macmini-m5-jiuwen 'hostname; whoami; pwd; sw_vers; uname -m'
+ssh macmini-m5-jiuwen 'system_profiler SPHardwareDataType'
+ssh macmini-m5-jiuwen 'df -h /; vm_stat; sysctl hw.memsize'
+ssh macmini-m5-jiuwen 'ps -axo pid,user,%cpu,%mem,rss,etime,comm | head -n 80'
+ssh macmini-m5-jiuwen 'top -l 3 -s 1 -stats pid,user,cpu,mem,command'
+ssh macmini-m5-jiuwen 'vm_stat; memory_pressure; sysctl vm.swapusage; sysctl hw.memsize'
+ssh macmini-m5-jiuwen 'df -h /; iostat -d -w 1 -c 3; netstat -an | head -n 80'
+ssh macmini-m5-jiuwen 'pgrep -afil "ollama|splash|mlx"'
+ssh macmini-m5-jiuwen 'lsof -nP -iTCP -sTCP:LISTEN'
+ssh macmini-m5-jiuwen 'tail -n 100 <明确指定的日志文件>'
+ssh macmini-m5-jiuwen 'curl -fsS http://127.0.0.1:<port>/health'
 ```
 
 要求：
@@ -361,27 +313,28 @@ ssh <alias> 'df -h /; vm_stat'
 2. `data/**` 由 Git LFS 管理。看到 130 字节左右的 JSON/GGUF 可能是 LFS pointer，不是有效数据；先查文件大小。
 3. `docs/` 下有用户创建但尚未提交的 Markdown；这些内容有价值，编辑前先读，不要用生成内容覆盖。
 4. `results/xrouter_classifier_tiers.csv` 已提交，但它只代表某次分类器运行；换模型、换 prompt 口径或修分类器后要重新生成。
-5. 端侧报告与 HEAD 代码存在 9B→14B 的版本差异；以代码和当前重跑结果为准，不直接引用历史表格。
+5. 当前报告里的 `prompt_tokens`、`prefill_tokens`、`prefill_tps`、`cache_status`、`cache_hit_tokens` 仍为 null，不能补 0 或估算。
 6. 仓库没有正式单元测试套件；`tools/test_embedding_model.py` 是工具，不是完整测试。修改后至少做 `compileall`，涉及回放时再跑端到端脚本并核对样本数、成本和降级数。
 7. `results/devllmr_3model_pareto.png` 等图片可能对应旧口径；图表与 CSV 应成组更新，避免图和数不一致。
 
 ## 9. 当前任务状态与待办
 
-截至 2026-11-23：
+截至 2026-11-26：
 
-- XRouter 三角色离线回放已打通；
-- 4B 限流问题已通过 300s 超时、并发 6、退避重试解决，历史矩阵达到 882/882 LLM 打档；
-- HEAD 已将端侧回答模型切到 `Qwen3-14B`，分类输入改为 `prompt`，并修复 `data_loader` 的 UTF-8 读取；
-- 端侧成本=0、云侧真实计费口径已固定；
-- **仍待完成**：用 14B 口径重跑并刷新 `docs/edge_router_3model_eval_report.md` 与相关图表；确认报告中的“9B only/最终路由”叙述全部切换或在版本说明中明确保留历史结果。
+- 主线已经切换为 **jiuwen 单机端侧大模型评测**，云端路由暂不作为默认目标。
+- `Qwen3.8-27B` 已完成 2048/4096 输出上限下的单并发流式评测，报告分别位于：
+  - `docs/qwen38-27b-20261126-092930_评测总结报告.html`
+  - `docs/qwen38-27b-20261126-130755-stream-4096-shard_评测总结报告.html`
+- 逐请求字段已补齐 `sample_id`、`eval_name`、`model_name`、`correct`、`error`、`retry_count`，并加入覆盖率统计与图表。
+- `cache_status`、`cache_hit_tokens`、`prompt_tokens`、`prefill_tokens`、`prefill_tps`、`server_wall_s`、`reasoning_tokens` 当前仍为空或 `-1`，不能当作 0。
+- `Qwen3.8-27B` 4096 单并发下，机器侧 GPU 使用率接近 100%，GPU 功率约 34W，热控 Nominal，Swap 基本平稳。
 
-Mac 侧后续顺序：
+仍待完成：
 
-1. 在 3.13 跑 Qwen3.8-27B Splash 基线（8k/32k/64k）；
-2. 释放 Splash 后测 Qwen3.6-35B-A3B；
-3. 安装 Gemma-4-26B-A4B 4bit 并错峰测试；
-4. 125B-A6B 暂不进入正式基线；
-5. 将 TTFT、Prefill、Decode、峰值内存、swap、失败率汇总为 Markdown。
+1. 在 jiuwen 上完成 3–6 题流式冒烟测试，并采集 CPU/GPU/内存。
+2. 补齐服务端返回的 `prompt_tokens`、`prefill_s`、`cache_hit_tokens`，避免手填或估算。
+3. 接入理论峰值算力/带宽与每 token FLOPs/bytes，推导“有效算力利用率”和“有效带宽利用率”。
+4. 若跑正式并发阶梯，需要补齐 2/4/8 档并保持同一输出上限。
 
 ## 10. 工作方式与验证要求
 

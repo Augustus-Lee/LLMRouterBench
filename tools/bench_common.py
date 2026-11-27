@@ -560,6 +560,7 @@ class OpenAICompatClient:
             "top_p": top_p,
             "seed": seed,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         req = urllib.request.Request(
             self.url,
@@ -586,8 +587,11 @@ class OpenAICompatClient:
         last_chunk_t: Optional[float] = None
         content_chunks = 0
         content_parts: List[str] = []
+        reasoning_parts: List[str] = []
         finish_reason: Optional[str] = None
         usage: Optional[Dict[str, Any]] = None
+        server_timings: Optional[Dict[str, Any]] = None
+        server_metrics: Optional[Dict[str, Any]] = None
         first_token_time: Optional[str] = None
 
         try:
@@ -610,15 +614,26 @@ class OpenAICompatClient:
                     if finish:
                         finish_reason = finish
                     delta = choices[0].get("delta") or {}
-                    if delta.get("content"):
-                        content_chunks += 1
-                        content_parts.append(delta["content"])
+                    piece = delta.get("content") or ""
+                    # ollama 用 delta.reasoning；Splash/OpenAI 用 delta.reasoning_content
+                    reason_piece = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    if piece or reason_piece:
+                        # 首 token 以“任一非空 delta”为准：推理模型先出 reasoning
                         if first_content_t is None:
                             first_content_t = now
                             ttft_s = now - started
                             first_token_time = _iso_now()
+                        content_chunks += 1
+                        if piece:
+                            content_parts.append(piece)
+                        if reason_piece:
+                            reasoning_parts.append(reason_piece)
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                if chunk.get("timings"):
+                    server_timings = chunk
+                if chunk.get("metrics"):
+                    server_metrics = chunk
         except (OSError, urllib.error.URLError) as exc:
             raise BenchRequestError(f"stream interrupted: {exc}") from exc
         finally:
@@ -631,12 +646,27 @@ class OpenAICompatClient:
             completion_tokens = usage.get("completion_tokens")
         else:
             completion_tokens = content_chunks if content_chunks else None
-        reasoning_tokens = _extract_reasoning_tokens({}, usage)
+        # 服务端 timings / metrics（splash 流式在 finish/usage chunk 返回）
+        server_prefill_s: Optional[float] = None
+        server_decode_s: Optional[float] = None
+        timing_source = "client"
+        if server_timings is not None:
+            sp, sd, src = extract_server_timings(server_timings)
+            if src == "server":
+                server_prefill_s, server_decode_s = sp, sd
+                timing_source = "server"
+        reasoning_tokens = _extract_reasoning_tokens(server_metrics or {}, usage)
         cache_status, cache_hit_tokens = _extract_cache_status(usage)
 
-        decode_s: Optional[float] = None
+        # 客户端测算（服务端 timings 缺失时回退）
+        client_decode_s: Optional[float] = None
         if first_content_t is not None and last_chunk_t is not None:
-            decode_s = max(0.0, last_chunk_t - first_content_t)
+            client_decode_s = max(0.0, last_chunk_t - first_content_t)
+        prefill_s = server_prefill_s
+        decode_s = server_decode_s if server_decode_s is not None else client_decode_s
+        prefill_tps = None
+        if prefill_s and prefill_s > 0 and prompt_tokens:
+            prefill_tps = prompt_tokens / prefill_s
         decode_tps = None
         if decode_s and decode_s > 0 and completion_tokens:
             decode_tps = completion_tokens / decode_s
@@ -644,6 +674,7 @@ class OpenAICompatClient:
         return {
             "stream": True,
             "content": "".join(content_parts) if content_parts else None,
+            "reasoning_content": "".join(reasoning_parts) if reasoning_parts else None,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "reasoning_tokens": reasoning_tokens,
@@ -654,12 +685,12 @@ class OpenAICompatClient:
             "first_token_time": first_token_time,
             "response_end_time": response_end_time,
             "ttft_s": ttft_s,
-            "prefill_s": None,  # 客户端无法拆分 prefill
+            "prefill_s": prefill_s,
             "decode_s": decode_s,
-            "prefill_tok_per_s": None,
+            "prefill_tok_per_s": prefill_tps,
             "decode_tok_per_s": decode_tps,
             "e2e_s": e2e_s,
-            "timing_source": "client",
+            "timing_source": timing_source,
             "finish_reason": finish_reason,
             "error": None,
             "success": True,

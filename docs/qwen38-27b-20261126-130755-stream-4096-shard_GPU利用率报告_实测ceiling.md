@@ -1,0 +1,43 @@
+# GPU 利用率分析报告
+
+> run: `qwen38-27b-20261126-130755-stream-4096-shard (measured ceiling)`
+
+## 输入
+
+- metrics: `/Users/jiuwen/AA/results/mac_benchmark/runs/qwen38-27b-20261126-130755-stream-4096-shard/monitor/stream/metrics.jsonl`
+- workload: `/Users/jiuwen/AA/results/mac_benchmark/runs/qwen38-27b-20261126-130755-stream-4096-shard/monitor/stream/workload_counters.jsonl`
+- power ceiling: 37400.0 mW（用户指定）
+
+## 方法
+
+- `busy_fraction = count(gpu_usage_percent >= 95) / count(all)`
+- `full_load_fraction = count(gpu_usage_percent >= 95 AND gpu_power_mw >= 0.90 * power_ceiling) / count(all)`
+- 若未显式提供官方 TDP，`power_ceiling` 取本轮活跃窗口 GPU 功耗 P95，仅代表本轮观察上限。
+
+## 总体活跃窗口
+
+| 指标 | n | mean | median | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| GPU active residency (%) | 2793 | 99.96 | 100.00 | 100.00 | 100.00 |
+| GPU power (mW) | 2793 | 33745.67 | 33860.00 | 35209.00 | 50778.00 |
+| GPU frequency (MHz) | 2793 | 1504.25 | 1504.00 | 1518.00 | 1620.00 |
+
+- busy_fraction: **99.75%**
+- full_load_fraction: **68.60%**
+
+## 分阶段
+
+| 并发 | 样本数 | usage median | usage p95 | power median | power p95 | freq median | busy_fraction | full_load_fraction |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2514 | 100.00% | 100.00% | 33900.00 mW | 35268.00 mW | 1505.00 MHz | 99.72% | 76.01% |
+| 2 | 190 | 100.00% | 100.00% | 30878.50 mW | 32336.00 mW | 1487.50 MHz | 100.00% | 1.58% |
+
+## 曲线图
+
+![GPU overlay](gpu_utilization_overlay.png)
+
+## 解读
+
+- `GPU active residency` 接近 100% 只说明 GPU 一直在工作。
+- 必须结合 power/freq：如果 usage 高但 power 明显低于上限，通常代表访存/带宽瓶颈或低 ALU 占用，不能宣称“算力满载”。
+- 如果 usage 与 power 同时接近上限，才是接近计算饱和。
